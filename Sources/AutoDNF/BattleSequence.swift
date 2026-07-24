@@ -83,6 +83,8 @@ final class BattleSequence {
     }
 
     private func collectDrops() async throws {
+        try await followRewardGuideArrows()
+
         // The game supports clicking an item label directly. Restrict clicks to
         // the lower-middle world area so HUD controls and settlement buttons
         // can never be mistaken for drops.
@@ -115,6 +117,32 @@ final class BattleSequence {
         guard emptyFrames >= 2 else {
             throw AutomationError.timedOut("click-collecting boss drops")
         }
+    }
+
+    private func followRewardGuideArrows() async throws {
+        var missingFrames = 0
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline, missingFrames < 2 {
+            let window = try controller.findWindow()
+            let image = try controller.captureWindow(window)
+            guard let direction = GuideArrowDetector.direction(in: image) else {
+                missingFrames += 1
+                try await Task.sleep(for: .milliseconds(450))
+                continue
+            }
+            missingFrames = 0
+            let keys = [direction.horizontal, direction.vertical].compactMap { $0 }
+            try await controller.holdKeys(
+                keys,
+                for: .milliseconds(500),
+                label: "reward guide \(direction.description)"
+            )
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        guard missingFrames >= 2 else {
+            throw AutomationError.timedOut("following reward guidance arrows")
+        }
+        print("Reward guidance arrows cleared; switching to item clicks.")
     }
 
     private func dropLabelCandidates(in items: [OCRItem]) -> [OCRItem] {

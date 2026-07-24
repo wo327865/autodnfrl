@@ -14,6 +14,7 @@ struct AutoDNF {
         let realmOnly = arguments.contains("realm")
         let combatOnly = arguments.contains("combat")
         let pickupOnly = arguments.contains("pickup")
+        let guideScan = arguments.contains("guide-scan")
         let hint = option("--window", in: arguments) ?? "地下城与勇士"
         let controller = MacController(windowHint: hint, dryRun: !execute)
 
@@ -29,6 +30,16 @@ struct AutoDNF {
                 let items = try await controller.recognize(window: window)
                 for item in items.sorted(by: { $0.box.midY > $1.box.midY }) {
                     print(String(format: "(%.3f, %.3f) %@", item.center.x, item.center.y, item.text))
+                }
+                return
+            }
+            if guideScan {
+                let window = try controller.findWindow()
+                let image = try controller.captureWindow(window)
+                if let direction = GuideArrowDetector.direction(in: image) {
+                    print("Guide direction: \(direction.description)")
+                } else {
+                    print("No reward guide arrow detected.")
                 }
                 return
             }

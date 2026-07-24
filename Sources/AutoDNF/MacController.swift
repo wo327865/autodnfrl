@@ -53,7 +53,7 @@ final class MacController {
     }
 
     func recognize(window: WindowTarget) async throws -> [OCRItem] {
-        let image = try capture(window: window)
+        let image = try captureWindow(window)
         return try await withCheckedThrowingContinuation { continuation in
             let request = VNRecognizeTextRequest { request, error in
                 if let error {
@@ -149,6 +149,33 @@ final class MacController {
         up.post(tap: .cghidEventTap)
     }
 
+    func holdKeys(
+        _ codes: [CGKeyCode],
+        for duration: Duration,
+        label: String
+    ) async throws {
+        print("hold \(label)")
+        guard !dryRun else { return }
+        try await focusGame()
+        let events = codes.compactMap {
+            (
+                CGEvent(keyboardEventSource: nil, virtualKey: $0, keyDown: true),
+                CGEvent(keyboardEventSource: nil, virtualKey: $0, keyDown: false)
+            )
+        }
+        guard events.count == codes.count else {
+            throw AutomationError.captureFailed("could not create keyboard events")
+        }
+        events.forEach { $0.0?.post(tap: .cghidEventTap) }
+        do {
+            try await Task.sleep(for: duration)
+            events.reversed().forEach { $0.1?.post(tap: .cghidEventTap) }
+        } catch {
+            events.reversed().forEach { $0.1?.post(tap: .cghidEventTap) }
+            throw error
+        }
+    }
+
     private func focusGame() async throws {
         let window = try findWindow()
         guard let application = NSRunningApplication(processIdentifier: window.pid) else {
@@ -158,7 +185,7 @@ final class MacController {
         try await Task.sleep(for: .milliseconds(120))
     }
 
-    private func capture(window: WindowTarget) throws -> CGImage {
+    func captureWindow(_ window: WindowTarget) throws -> CGImage {
         let output = FileManager.default.temporaryDirectory
             .appendingPathComponent("autodnf-\(UUID().uuidString).png")
         defer { try? FileManager.default.removeItem(at: output) }
