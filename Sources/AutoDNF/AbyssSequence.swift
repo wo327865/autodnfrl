@@ -170,36 +170,64 @@ final class AbyssSequence {
     private func rankedCandidatePoints(
         items: [OCRItem]
     ) -> [(power: Int, point: CGPoint)] {
-        let lockedRowYs = matches("完成前置任务后才能解锁", in: items).map(\.box.midY)
+        let fatigueItems: [(item: OCRItem, value: Int)] = items.compactMap { item in
+            let text = item.normalizedText
+            guard text.allSatisfy(\.isNumber),
+                  let value = Int(text),
+                  value >= 0, value <= 100,
+                  item.center.x > 0.14, item.center.x < 0.90,
+                  item.center.y > 0.15, item.center.y < 0.68 else {
+                return nil
+            }
+            return (item, value)
+        }
+        let selectedItems = matches("选择完成", in: items)
         var result: [(Int, CGPoint)] = []
 
         for item in items {
             guard item.text.contains(",") || item.text.contains("，"),
                   let power = Text.combatPower(from: item.text),
-                  item.box.midY > 0.40, item.box.midY < 0.68,
-                  !lockedRowYs.contains(where: { abs($0 - item.box.midY) < 0.08 })
+                  item.box.midX > 0.14, item.box.midX < 0.90,
+                  item.box.midY > 0.15, item.box.midY < 0.68
             else { continue }
 
-            // Dialog cards occupy three stable columns, while their order and
-            // names may change. Click the center of the number's card.
-            let cardX: CGFloat
-            switch item.box.midX {
-            case ..<0.40: cardX = 0.267
-            case ..<0.64: cardX = 0.511
-            default: cardX = 0.755
+            let column = cardColumn(for: item.center.x)
+            let matchingFatigue = fatigueItems.first {
+                cardColumn(for: $0.item.center.x) == column &&
+                    abs($0.item.center.y - item.center.y) < 0.055
             }
+            guard let fatigue = matchingFatigue?.value, fatigue >= 10 else {
+                continue
+            }
+            let alreadySelected = selectedItems.contains {
+                cardColumn(for: $0.center.x) == column &&
+                    abs($0.center.y - item.center.y) < 0.085
+            }
+            guard !alreadySelected else { continue }
+
+            // Names and row counts may change. Power and fatigue observations
+            // identify each eligible card; only column centers are structural.
+            let cardX: CGFloat = [0.267, 0.511, 0.755][column]
             result.append((power, CGPoint(x: cardX, y: item.box.midY + 0.035)))
         }
 
         // De-duplicate OCR alternatives from the same card and rank by power.
-        var byColumn: [Int: (Int, CGPoint)] = [:]
+        var byCard: [String: (Int, CGPoint)] = [:]
         for candidate in result {
             let column = Int(candidate.1.x * 10)
-            if candidate.0 > (byColumn[column]?.0 ?? -1) {
-                byColumn[column] = candidate
+            let row = Int(candidate.1.y * 10)
+            let key = "\(column):\(row)"
+            if candidate.0 > (byCard[key]?.0 ?? -1) {
+                byCard[key] = candidate
             }
         }
-        return byColumn.values.sorted { $0.0 > $1.0 }
+        return byCard.values.sorted { $0.0 > $1.0 }
+    }
+
+    private func cardColumn(for x: CGFloat) -> Int {
+        if x < 0.39 { return 0 }
+        if x < 0.65 { return 1 }
+        return 2
     }
 
     private func recognizedPartyPowers(in items: [OCRItem]) -> [Int] {
