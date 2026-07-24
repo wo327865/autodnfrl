@@ -61,11 +61,37 @@ final class MacController {
                     return
                 }
                 let items = (request.results as? [VNRecognizedTextObservation] ?? [])
-                    .compactMap { observation -> OCRItem? in
+                    .flatMap { observation -> [OCRItem] in
                         guard let candidate = observation.topCandidates(1).first else {
-                            return nil
+                            return []
                         }
-                        return OCRItem(text: candidate.string, box: observation.boundingBox)
+                        var recognized = [
+                            OCRItem(text: candidate.string, box: observation.boundingBox)
+                        ]
+
+                        // Vision can merge adjacent buttons into one line, for
+                        // example "取消 确认". Preserve the full line for state
+                        // matching, but also retain precise geometry for every
+                        // whitespace-delimited token so clicks land on the
+                        // intended button rather than between buttons.
+                        let tokens = candidate.string.split(whereSeparator: \.isWhitespace)
+                        if tokens.count > 1 {
+                            var searchStart = candidate.string.startIndex
+                            for tokenSlice in tokens {
+                                let token = String(tokenSlice)
+                                guard let range = candidate.string.range(
+                                    of: token,
+                                    range: searchStart..<candidate.string.endIndex
+                                ) else { continue }
+                                searchStart = range.upperBound
+                                if let rectangle = try? candidate.boundingBox(for: range) {
+                                    recognized.append(
+                                        OCRItem(text: token, box: rectangle.boundingBox)
+                                    )
+                                }
+                            }
+                        }
+                        return recognized
                     }
                 continuation.resume(returning: items)
             }

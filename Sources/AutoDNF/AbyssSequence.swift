@@ -253,7 +253,9 @@ final class AbyssSequence {
         in items: [OCRItem],
         window: WindowTarget
     ) throws {
-        let found = matches(target, in: items)
+        let normalizedTarget = Text.normalized(target)
+        let exact = items.filter { $0.normalizedText == normalizedTarget }
+        let found = exact.isEmpty ? matches(target, in: items) : exact
         guard found.count == 1 else {
             if found.isEmpty { throw AutomationError.expectedText(target) }
             throw AutomationError.ambiguousText(target, found.count)
