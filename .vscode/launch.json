@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:autodnf}",
+            "name": "Debug autodnf",
+            "target": "autodnf",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug autodnf"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:autodnf}",
+            "name": "Release autodnf",
+            "target": "autodnf",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release autodnf"
+        }
+    ]
+}
