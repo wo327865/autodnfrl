@@ -15,6 +15,8 @@ struct AutoDNF {
         let combatOnly = arguments.contains("combat")
         let pickupOnly = arguments.contains("pickup")
         let guideScan = arguments.contains("guide-scan")
+        let confirmationScan = arguments.contains("confirmation-scan")
+        let confirmOnly = arguments.contains("confirm")
         let hint = option("--window", in: arguments) ?? "地下城与勇士"
         let controller = MacController(windowHint: hint, dryRun: !execute)
 
@@ -43,12 +45,24 @@ struct AutoDNF {
                 }
                 return
             }
+            if confirmationScan {
+                let window = try controller.findWindow()
+                let image = try controller.captureWindow(window)
+                if let point = ConfirmationButtonDetector.confirmationPoint(in: image) {
+                    print(String(format: "Confirmation button: (%.3f, %.3f)", point.x, point.y))
+                } else {
+                    print("No gold confirmation button detected.")
+                }
+                return
+            }
 
             if !execute {
                 print("Safety: dry-run is the default. Pass --execute to allow clicks.")
             }
             let sequence = AbyssSequence(controller: controller, dryRun: !execute)
-            if pickupOnly {
+            if confirmOnly {
+                try await sequence.confirmPendingTravel()
+            } else if pickupOnly {
                 for _ in 0..<18 {
                     try await controller.holdKey(
                         code: 125,

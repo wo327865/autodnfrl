@@ -47,16 +47,34 @@ final class AbyssSequence {
         print("Formation is ready. Sequence intentionally stops before 入场.")
     }
 
+    func confirmPendingTravel() async throws {
+        try await confirmTravel()
+    }
+
     private func confirmTravel() async throws {
         let deadline = Date().addingTimeInterval(timeout)
         repeat {
             let window = try controller.findWindow()
             let items = try await controller.recognize(window: window)
             if !matches("提示", in: items).isEmpty,
-               !matches("时空秘境城镇", in: items).isEmpty,
-               !matches("确认", in: items).isEmpty {
-                try clickUnique("确认", in: items, window: window)
-                return
+               !matches("时空秘境城镇", in: items).isEmpty {
+                let exactConfirm = items.filter {
+                    $0.normalizedText == "确认" &&
+                        $0.center.x > 0.50 && $0.center.y > 0.25 && $0.center.y < 0.48
+                }
+                if exactConfirm.count == 1 {
+                    try controller.click(
+                        exactConfirm[0].center,
+                        in: window,
+                        label: "exact confirmation button"
+                    )
+                    return
+                }
+                let image = try controller.captureWindow(window)
+                if let point = ConfirmationButtonDetector.confirmationPoint(in: image) {
+                    try controller.click(point, in: window, label: "visual confirmation fallback")
+                    return
+                }
             }
             if !matches("时空秘境", in: items).isEmpty,
                !matches("普通秘境", in: items).isEmpty {
