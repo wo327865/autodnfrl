@@ -126,6 +126,146 @@ class AutoDNF:
             raise RuntimeError(f"Unexpected travel result: {state}")
         self.continue_from_realm_selection(battle)
 
+    def run_all_characters(self) -> None:
+        """Run the dungeon, then rotate through every character with fatigue."""
+        round_number = 1
+        while True:
+            current_fatigue = self.wait_for_town_fatigue()
+            if current_fatigue < 10:
+                print(
+                    f"Current character has only {current_fatigue}/100 fatigue; "
+                    "switching characters"
+                )
+                if not self.switch_to_available_character():
+                    print("No character with at least 10 fatigue was found. Automation complete.")
+                    return
+                # Confirm the newly logged-in character independently before
+                # entering the commission workflow.
+                continue
+            print(f"Current character has {current_fatigue}/100 fatigue; continuing to 委托")
+            print(f"Starting character round {round_number}")
+            self.run_to_party(battle=True)
+            round_number += 1
+
+    def wait_for_town_fatigue(self, timeout: float = 12) -> int:
+        """Read the current character's top-left fatigue display in town."""
+        window, boxes = self.wait_for(["委托", "选角"], "town character controls", timeout=60)
+        deadline = time.monotonic() + timeout
+        while True:
+            fatigue = self.town_fatigue(boxes)
+            if fatigue is not None:
+                print(f"Detected town character fatigue: {fatigue}/100")
+                return fatigue
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Could not read current character fatigue from the town HUD")
+            time.sleep(0.5)
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+
+    @staticmethod
+    def town_fatigue(boxes: list[TextBox]) -> int | None:
+        readings: list[tuple[TextBox, int]] = []
+        for box in boxes:
+            match = re.fullmatch(r"(\d{1,3})/100", box.normalized)
+            if (
+                match
+                and 0 <= int(match.group(1)) <= 100
+                # Current-character HUD is in the upper-left of the town
+                # window. Restricting the region avoids unrelated /100 text.
+                and box.center[0] < 0.32
+                and box.center[1] > 0.72
+            ):
+                readings.append((box, int(match.group(1))))
+        if not readings:
+            return None
+        return min(
+            readings,
+            key=lambda reading: (
+                (reading[0].center[0] - 0.15) ** 2
+                + (reading[0].center[1] - 0.88) ** 2
+            ),
+        )[1]
+
+    def switch_to_available_character(self) -> bool:
+        """Choose another character with enough fatigue for one dungeon."""
+        window, boxes = self.wait_for(["委托", "选角"], "town character controls", timeout=60)
+        self.click_from_boxes("选角", window, boxes, "character selection")
+        window, boxes = self.wait_for(
+            ["挑战进度", "开始游戏"],
+            "character selection board",
+            timeout=15,
+        )
+
+        seen_pages: set[tuple[str, ...]] = set()
+        for page_number in range(1, 7):
+            fatigue_rows = [
+                (box, int(match.group(1)))
+                for box in boxes
+                if (match := re.fullmatch(r"(\d{1,3})/100", box.normalized))
+                and 0 <= int(match.group(1)) <= 100
+                and 0.18 < box.center[1] < 0.78
+            ]
+            page_signature = tuple(
+                sorted(
+                    box.normalized
+                    for box in boxes
+                    if 0.18 < box.center[1] < 0.82 and box.normalized
+                )
+            )
+            if page_signature in seen_pages:
+                print("Character-selection pages have wrapped; no available character remains")
+                return False
+            seen_pages.add(page_signature)
+
+            available = sorted(
+                ((fatigue, box.center[1]) for box, fatigue in fatigue_rows if fatigue >= 10),
+                key=lambda item: (-item[0], -item[1]),
+            )
+            if available:
+                fatigue, row_y = available[0]
+                print(
+                    f"Selecting character with {fatigue}/100 fatigue "
+                    f"from board page {page_number}"
+                )
+                self.client.click(window, (0.45, row_y), f"available character ({fatigue}/100)")
+                time.sleep(0.8)
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                self.click_right_button("开始游戏", window, boxes, "start selected character")
+                self.wait_for(
+                    ["委托", "选角"],
+                    "new character logged into town",
+                    timeout=90,
+                )
+                print("New character login complete")
+                return True
+
+            # The board can contain multiple pages. The verified board layout
+            # has a right-page arrow midway down its right edge. Stop if the
+            # click does not produce a new OCR page instead of looping blindly.
+            print(f"No fatigue >= 10 on character board page {page_number}; checking next page")
+            previous_signature = page_signature
+            self.client.click(window, (0.955, 0.47), "next character-board page")
+            page_deadline = time.monotonic() + 4
+            while time.monotonic() < page_deadline:
+                time.sleep(0.5)
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                new_signature = tuple(
+                    sorted(
+                        box.normalized
+                        for box in boxes
+                        if 0.18 < box.center[1] < 0.82 and box.normalized
+                    )
+                )
+                if new_signature != previous_signature:
+                    break
+            else:
+                print("Character board did not advance; no available character remains")
+                return False
+        print("Character board safety limit reached")
+        return False
+
     def continue_from_realm_selection(self, battle: bool = False) -> None:
         self.click_then_wait(
             "普通秘境",
@@ -136,6 +276,8 @@ class AutoDNF:
         self.configure_party()
         if battle:
             self.run_battle(start_by_entering=True)
+        else:
+            print("Party setup complete. Use --battle to enter the dungeon automatically.")
 
     def wait_for_realm_selection(self, timeout: float) -> str:
         # The three cards can vary by game version/account.  Any two stable
@@ -185,8 +327,23 @@ class AutoDNF:
     def configure_party(self) -> None:
         deadline = time.monotonic() + 8
         slot_point: tuple[float, float] | None = None
+        current_fatigue: int | None = None
         while True:
             window, boxes = self.wait_for(["普通秘境"], "party setup", timeout=6)
+            fatigue_readings = [
+                (box, int(match.group(1)))
+                for box in boxes
+                if (match := re.fullmatch(r"(\d{1,3})/100", box.normalized))
+                and 0 <= int(match.group(1)) <= 100
+            ]
+            if fatigue_readings:
+                # The crowned current character occupies the middle card. If
+                # an incomplete formation already has another card, choose
+                # the fatigue label closest to that middle-card position.
+                current_fatigue = min(
+                    fatigue_readings,
+                    key=lambda reading: abs(reading[0].center[0] - 0.68),
+                )[1]
             slots = sorted(find("可配置角色", boxes), key=lambda box: box.center[0])
             party_fatigue = len(find("100/100", boxes))
             party_power = len([box for box in boxes if re.fullmatch(r"\d{1,3}(?:[,，]\d{3})+", box.text or "")])
@@ -206,6 +363,10 @@ class AutoDNF:
             time.sleep(0.5)
 
         assert slot_point is not None
+        if current_fatigue is not None:
+            print(f"Current character fatigue: {current_fatigue}/100")
+        else:
+            print("Current character fatigue was not OCR-visible; using visual card order")
         for attempt in range(1, 4):
             self.client.click(window, slot_point, f"first empty party slot ({attempt}/3)")
             try:
@@ -224,26 +385,103 @@ class AutoDNF:
         # companions. Vision can read the label before a click but often misses
         # its bright green post-click rendering, so it is advisory rather than
         # a required state transition.
-        selected = len(find("选择完成", boxes))
-        needed = max(0, 2 - selected)
-        candidates = self.eligible_cards(boxes)
-        if len(candidates) < needed:
-            raise RuntimeError("Could not locate enough visible character cards")
+        # The modal title and button render before the animated card contents.
+        # Do not treat the first OCR frame as a complete picker: wait until
+        # enough cards have a readable, usable fatigue value.
+        card_deadline = time.monotonic() + 8
+        enough_cards_since: float | None = None
+        candidates_by_point: dict[tuple[float, float], tuple[int, tuple[float, float]]] = {}
+        announced_card_wait = False
+        while True:
+            selected = len(find("选择完成", boxes))
+            needed = max(0, 2 - selected)
+            frame_candidates = self.eligible_cards(
+                boxes,
+                target_fatigue=current_fatigue,
+                emit_debug=False,
+            )
+            for candidate in frame_candidates:
+                candidates_by_point[candidate[1]] = candidate
+            candidates = sorted(
+                candidates_by_point.values(),
+                key=lambda candidate: self.card_sort_key(candidate, current_fatigue),
+            )
+
+            now = time.monotonic()
+            if len(candidates) >= needed:
+                if enough_cards_since is None:
+                    enough_cards_since = now
+                # Do not immediately use the first readable row. Vision often
+                # recognizes the partially covered bottom row one frame before
+                # the fully visible middle row. Combine frames briefly so row
+                # two wins the normal top-to-bottom ordering.
+                if now - enough_cards_since >= 2:
+                    break
+            if now >= card_deadline:
+                if len(candidates) >= needed:
+                    break
+                # Emit the final OCR details once, rather than flooding debug
+                # output for every incomplete animation frame.
+                self.eligible_cards(
+                    boxes,
+                    target_fatigue=current_fatigue,
+                    emit_debug=True,
+                )
+                raise RuntimeError(
+                    f"Could not locate enough visible character cards "
+                    f"(needed {needed}, found {len(candidates)})"
+                )
+            if not announced_card_wait:
+                print("Character cards are still rendering; waiting for readable fatigue values")
+                announced_card_wait = True
+            time.sleep(0.5)
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+        if self.debug:
+            # Print the candidates accumulated from the settled OCR frames.
+            column_name = ("left", "middle", "right")
+            print(f"Party picker debug: {selected} companion(s) already selected")
+            for card_fatigue, point in candidates:
+                card_column = 0 if point[0] < 0.39 else 1 if point[0] < 0.65 else 2
+                row = 1 if point[1] > 0.50 else 2 if point[1] > 0.34 else 3
+                difference = (
+                    f", difference {abs(card_fatigue - current_fatigue)}"
+                    if current_fatigue is not None
+                    else ""
+                )
+                print(
+                    f"  usable card: row {row}, {column_name[card_column]}, "
+                    f"fatigue {card_fatigue}{difference} "
+                    f"(normalized {point[0]:.3f}, {point[1]:.3f})"
+                )
         for index, (_, point) in enumerate(candidates[:needed], start=1):
             self.client.click(window, point, f"eligible character for companion slot {selected + index}")
             time.sleep(0.7)
             boxes = self.client.ocr(window)
             observed = len(find("选择完成", boxes))
             if observed < selected + index:
-                print("Selection marker was not OCR-visible after click; continuing in visual grid order")
+                print("Selection marker was not OCR-visible after click; card was fatigue-verified before clicking")
         complete = exact("编队完成", boxes)
         if len(complete) != 1:
             raise RuntimeError("Could not identify formation-complete button")
         for attempt in range(1, 4):
             self.client.click(window, complete[0].center, f"编队完成 ({attempt}/3)")
             time.sleep(0.8)
-            boxes = self.client.ocr(window)
-            if not find("选择冒险团角色", boxes):
+            # Vision occasionally misses the bright picker title for one
+            # frame. Require two consecutive frames without it before
+            # deciding that the modal really closed.
+            picker_absent_frames = 0
+            for _ in range(3):
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                if find("选择冒险团角色", boxes):
+                    picker_absent_frames = 0
+                    break
+                picker_absent_frames += 1
+                if picker_absent_frames >= 2:
+                    break
+                time.sleep(0.4)
+            if picker_absent_frames >= 2:
                 print("Party formation saved")
                 return
             print(f"编队完成 did not close the picker; retrying ({attempt}/3)")
@@ -273,12 +511,10 @@ class AutoDNF:
                 if find("使用角色金库", boxes):
                     self.click_right_button("确认", window, boxes, "entry material confirmation")
         deadline = time.monotonic() + 60 * 60
+        town_frames = 0
         while time.monotonic() < deadline:
             window = self.client.find_window()
             boxes = self.client.ocr(window)
-            if find("委托", boxes) or find("返回城镇", boxes):
-                print("Town screen detected. Battle loop complete.")
-                return
             # Confirmation dialog after the standalone final 结算 button.
             # Check this before the dimmed background's exact 结算 text.
             if find("完成结算", boxes) and exact("确认", boxes):
@@ -311,6 +547,39 @@ class AutoDNF:
                 self.collect_visible_rewards()
                 self.retry_or_exit()
                 continue
+            # After final settlement the exhausted party remains inside the
+            # dungeon and still shows multiple /100 HUD labels. An exact
+            # right-side 返回城镇 button is therefore stronger evidence than
+            # the generic in-dungeon HUD and should be acted on immediately.
+            if exact("返回城镇", boxes) and not exact("委托", boxes):
+                self.click_right_button("返回城镇", window, boxes, "return to town")
+                self.wait_for(
+                    ["委托", "选角"],
+                    "town after dungeon exit",
+                    timeout=90,
+                )
+                print("Returned to town. Battle loop complete.")
+                return
+            # Check town only after every result-screen branch. A boss-room
+            # notification can contain the substring 委托, so an inexact,
+            # single-frame match can otherwise terminate the dungeon loop
+            # before rewards are collected. Require an exact town control,
+            # no dungeon/result evidence, and two consecutive OCR frames.
+            dungeon_evidence = (
+                bool(find("再次挑战", boxes))
+                or bool(find("领奖结算", boxes))
+                or bool(find("秘境：", boxes))
+                or len(find("/100", boxes)) >= 2
+            )
+            town_control = bool(exact("委托", boxes))
+            if town_control and not dungeon_evidence:
+                town_frames += 1
+                if town_frames >= 2:
+                    print("Town screen detected. Battle loop complete.")
+                    return
+                time.sleep(0.6)
+                continue
+            town_frames = 0
             if find("秘境：", boxes) or len(find("/100", boxes)) >= 3:
                 self.client.hold([124], 0.8)  # right arrow
                 time.sleep(0.4)
@@ -361,7 +630,7 @@ class AutoDNF:
         reward_markers = (
             "[", "]", "【", "】", "角色绑定", "超武", "材料", "四维时空",
             "星核", "星源", "碎片", "神秘", "炉岩", "炭", "斯卡迪", "印章",
-            "角色", "绑定"
+            "角色", "绑定", "稀有", "源石", "石矿"
         )
         labels = [
             box for box in boxes
@@ -418,9 +687,22 @@ class AutoDNF:
             raise RuntimeError(f"Could not identify exact right-side {text!r} button")
         self.client.click(window, choices[0].center, label)
 
-    def eligible_cards(self, boxes: list[TextBox]) -> list[tuple[int, tuple[float, float]]]:
+    def eligible_cards(
+        self,
+        boxes: list[TextBox],
+        target_fatigue: int | None = None,
+        emit_debug: bool | None = None,
+    ) -> list[tuple[int, tuple[float, float]]]:
+        row_centers = (0.57, 0.41, 0.25)
+
         def column(x: float) -> int:
             return 0 if x < 0.39 else 1 if x < 0.65 else 2
+
+        def row(y: float) -> int:
+            # Assign every OCR observation to exactly one grid row. The rows
+            # are only 0.16 apart, so independent +/- tolerances can overlap
+            # and incorrectly transfer fatigue/blocking state to a neighbour.
+            return min(range(len(row_centers)), key=lambda index: abs(y - row_centers[index]))
 
         fatigue: list[tuple[TextBox, int]] = []
         for box in boxes:
@@ -430,31 +712,72 @@ class AutoDNF:
         fatigue_blocked = find("疲劳值不足", boxes)
 
         # The picker itself is a fixed three-column grid. OCR establishes only
-        # whether a cell is explicitly selected or fatigue-blocked; it does
-        # not define the click coordinate. This avoids duplicate/misaligned
-        # rows when Vision misses a small stat label on an animated frame.
+        # whether a cell is selected or has usable fatigue; it does not define
+        # the click coordinate. Fatigue is printed just left of each card's
+        # horizontal centre. Restricting the match to that band prevents the
+        # character level (also a 0-100 integer) from being mistaken for
+        # fatigue.
         candidates: list[tuple[int, tuple[float, float]]] = []
-        for y in (0.57, 0.41, 0.25):
+        for row_index, y in enumerate(row_centers):
             for card_column, x in enumerate((0.267, 0.511, 0.755)):
                 is_selected = any(
-                    column(item.center[0]) == card_column and abs(item.center[1] - y) < 0.14
+                    column(item.center[0]) == card_column
+                    and row(item.center[1]) == row_index
                     for item in selected
                 )
                 is_blocked = any(
-                    column(item.center[0]) == card_column and abs(item.center[1] - y) < 0.16
+                    column(item.center[0]) == card_column
+                    and row(item.center[1]) == row_index
                     for item in fatigue_blocked
                 )
-                if not is_selected and not is_blocked:
-                    candidates.append((0, (x, y + 0.035)))
-        # Vision coordinates use a bottom-left origin: a higher y value is a
-        # visually higher row.  Deliberately preserve visual scan order rather
-        # than ranking characters by combat power.
-        candidates = sorted(candidates, key=lambda candidate: (-candidate[1][1], candidate[1][0]))
-        if self.debug:
+                fatigue_values = [
+                    value
+                    for item, value in fatigue
+                    if column(item.center[0]) == card_column
+                    and row(item.center[1]) == row_index
+                    and x - 0.09 < item.center[0] < x - 0.01
+                ]
+                usable_fatigue = max(fatigue_values, default=0)
+                if not is_selected and not is_blocked and usable_fatigue > 0:
+                    candidates.append((usable_fatigue, (x, y + 0.035)))
+        # Prefer fatigue closest to the current character so the party reaches
+        # its limit together. Vision's top-to-bottom, left-to-right grid order
+        # remains the deterministic tie-breaker.
+        candidates = sorted(
+            candidates,
+            key=lambda candidate: self.card_sort_key(candidate, target_fatigue),
+        )
+        if emit_debug is None:
+            emit_debug = self.debug
+        if emit_debug:
             column_name = ("left", "middle", "right")
             print(f"Party picker debug: {len(selected)} companion(s) already selected")
-            for index, (_, point) in enumerate(candidates, start=1):
+            if not candidates:
+                samples = ", ".join(
+                    f"{value}@({item.center[0]:.3f},{item.center[1]:.3f})"
+                    for item, value in fatigue
+                )
+                print(f"  numeric OCR samples: {samples or 'none'}")
+            for index, (card_fatigue, point) in enumerate(candidates, start=1):
                 card_column = column(point[0])
                 row = 1 if point[1] > 0.50 else 2 if point[1] > 0.34 else 3
-                print(f"  usable card: row {row}, {column_name[card_column]} (normalized {point[0]:.3f}, {point[1]:.3f})")
+                difference = (
+                    f", difference {abs(card_fatigue - target_fatigue)}"
+                    if target_fatigue is not None
+                    else ""
+                )
+                print(
+                    f"  usable card: row {row}, {column_name[card_column]}, "
+                    f"fatigue {card_fatigue}{difference} "
+                    f"(normalized {point[0]:.3f}, {point[1]:.3f})"
+                )
         return candidates
+
+    @staticmethod
+    def card_sort_key(
+        candidate: tuple[int, tuple[float, float]],
+        target_fatigue: int | None,
+    ) -> tuple[int, float, float]:
+        fatigue, point = candidate
+        difference = abs(fatigue - target_fatigue) if target_fatigue is not None else 0
+        return difference, -point[1], point[0]

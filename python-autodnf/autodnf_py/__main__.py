@@ -22,7 +22,10 @@ def main() -> None:
         for box in sorted(client.ocr(window), key=lambda item: -item.center[1]):
             print(f"({box.center[0]:.3f}, {box.center[1]:.3f}) {box.text}")
     elif args.command == "run":
-        flow.run_to_party(battle=args.battle)
+        if args.battle:
+            flow.run_all_characters()
+        else:
+            flow.run_to_party(battle=False)
     elif args.command == "realm":
         flow.continue_from_realm_selection(battle=args.battle)
     elif args.command == "party":

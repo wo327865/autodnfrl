@@ -20,6 +20,7 @@ macOS Privacy & Security settings.
 python -m autodnf_py scan
 python -m autodnf_py run
 python -m autodnf_py run --execute
+python -m autodnf_py run --battle --execute
 python -m autodnf_py party --execute
 python -m autodnf_py battle --execute
 ```
@@ -27,6 +28,9 @@ python -m autodnf_py battle --execute
 Commands are dry-run by default. `--execute` is required before any click or
 keyboard input is sent.
 
-`run` completes the town-to-party formation path. `battle` resumes only from an
-already active dungeon. The battle routine is intentionally conservative and
-stops on an unrecognized state.
+`run` completes the town-to-party formation path. `run --battle` continues
+through the dungeon, returns to town when fatigue is exhausted, switches to
+another character with at least 10 fatigue, and repeats until none remain.
+`battle` resumes only the current character from an already active dungeon.
+The battle routine is intentionally conservative and stops on an unrecognized
+state.
