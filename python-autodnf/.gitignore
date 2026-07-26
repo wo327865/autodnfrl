@@ -1,4 +1,9 @@
 .venv/
+dataset/images/
+dataset/labels/
+dataset/manifest.jsonl
+dataset/yolo/
+runs/
 __pycache__/
 *.pyc
 captures/

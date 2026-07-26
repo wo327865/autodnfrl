@@ -1,0 +1,7 @@
+# YOLO dataset definition. Run tools/prepare_detector_dataset.py first.
+path: yolo
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: loot_pile

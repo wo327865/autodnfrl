@@ -118,6 +118,15 @@ class MacClient:
         finally:
             path.unlink(missing_ok=True)
 
+    def capture_png(self, window: Window, destination: Path) -> None:
+        """Save an unmodified window frame for detector training data."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["/usr/sbin/screencapture", "-x", "-o", "-l", str(window.window_id), str(destination)],
+            check=True,
+            capture_output=True,
+        )
+
     def ocr(self, window: Window) -> list[TextBox]:
         request = VNRecognizeTextRequest.alloc().init()
         request.setRecognitionLevel_(VNRequestTextRecognitionLevelAccurate)

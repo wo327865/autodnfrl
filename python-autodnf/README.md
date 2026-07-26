@@ -23,6 +23,7 @@ python -m autodnf_py run --execute
 python -m autodnf_py run --battle --execute
 python -m autodnf_py party --execute
 python -m autodnf_py battle --execute
+python -m autodnf_py capture --tag boss_loot --count 20 --interval 0.7
 ```
 
 Commands are dry-run by default. `--execute` is required before any click or
@@ -34,3 +35,8 @@ another character with at least 10 fatigue, and repeats until none remain.
 `battle` resumes only the current character from an already active dungeon.
 The battle routine is intentionally conservative and stops on an unrecognized
 state.
+
+## Object-detector data
+
+`capture` saves read-only game frames for a custom loot/arrow detector. See
+[dataset/README.md](dataset/README.md) for collection and annotation steps.
