@@ -244,6 +244,59 @@ class MacClient:
                 ))
         return bytes(values)
 
+    def world_phase_frame(self, window: Window):
+        """Return a reduced grayscale world crop for phase correlation.
+
+        The crop excludes the party panel, result buttons, top menus and skill
+        bar. Phase correlation then measures coherent background translation
+        instead of treating character animation as camera movement.
+        """
+        try:
+            import cv2
+        except ImportError as error:
+            raise RuntimeError("OpenCV is required for phase-correlation edge detection") from error
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+            path = Path(handle.name)
+        try:
+            self.capture_png(window, path)
+            image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                raise RuntimeError("Could not decode phase-correlation frame")
+        finally:
+            path.unlink(missing_ok=True)
+
+        height, width = image.shape
+        crop = image[
+            int(height * 0.20):int(height * 0.68),
+            int(width * 0.16):int(width * 0.84),
+        ]
+        target_width = 640
+        scale = min(1.0, target_width / crop.shape[1])
+        if scale < 1.0:
+            crop = cv2.resize(
+                crop,
+                (target_width, max(1, round(crop.shape[0] * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        crop = cv2.GaussianBlur(crop, (5, 5), 0)
+        return crop.astype("float32")
+
+    @staticmethod
+    def phase_camera_motion(before, after) -> tuple[float, float, float]:
+        """Return horizontal/vertical shift and correlation response."""
+        if before.shape != after.shape or before.size == 0:
+            return 0.0, 0.0, 0.0
+        try:
+            import cv2
+        except ImportError as error:
+            raise RuntimeError("OpenCV is required for phase-correlation edge detection") from error
+
+        height, width = before.shape
+        window = cv2.createHanningWindow((width, height), cv2.CV_32F)
+        (shift_x, shift_y), response = cv2.phaseCorrelate(before, after, window)
+        return float(shift_x), float(shift_y), float(response)
+
     @staticmethod
     def scene_motion_score(before: bytes, after: bytes) -> float:
         """Return proportion of sampled colour channels changed by a scroll."""

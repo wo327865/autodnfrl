@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import time
 
+from .detector import LootPileDetector
 from .macos import MacClient, TextBox, Window
 
 
@@ -20,6 +21,7 @@ class AutoDNF:
     def __init__(self, client: MacClient, debug: bool = False) -> None:
         self.client = client
         self.debug = debug
+        self.loot_detector = LootPileDetector()
 
     def wait_for(self, texts: list[str], state: str, timeout: float = 18) -> tuple[Window, list[TextBox]]:
         _, window, boxes = self.wait_for_any({state: texts}, timeout)
@@ -633,16 +635,28 @@ class AutoDNF:
             time.sleep(0.6)
 
     def wait_for_reward_pile(self, timeout: float) -> tuple[float, float] | None:
-        """Allow reward labels to settle after a room/result transition."""
+        """Allow model/OCR pile evidence to settle after a transition."""
         deadline = time.monotonic() + timeout
         while True:
             window = self.client.find_window()
-            center = self.reward_pile_center(self.client.ocr(window))
+            center = self.detect_reward_pile(window)
             if center is not None:
                 return center
             if time.monotonic() >= deadline:
                 return None
             time.sleep(0.4)
+
+    def detect_reward_pile(self, window: Window) -> tuple[float, float] | None:
+        """Prefer the trained detector, then fall back to reward-specific OCR."""
+        detection = self.loot_detector.detect(self.client, window)
+        if detection is not None:
+            center = detection.center
+            print(
+                f"Model detected loot pile at ({center[0]:.2f}, {center[1]:.2f}), "
+                f"confidence {detection.confidence:.2f}"
+            )
+            return center
+        return self.reward_pile_center(self.client.ocr(window))
 
     def follow_reward_arrows(self) -> None:
         """Walk toward the cyan edge arrow until the remaining loot is visible."""
@@ -666,22 +680,32 @@ class AutoDNF:
             stationary_frames = 0
             for step in range(1, 13):
                 window = self.client.find_window()
-                if self.reward_pile_center(self.client.ocr(window)) is not None:
-                    print(f"Found reward text while exploring {direction}")
+                if self.detect_reward_pile(window) is not None:
+                    print(f"Found reward pile while exploring {direction}")
                     return
                 if self.client.reward_arrow_direction(window) is not None:
                     print(f"Found a reward arrow while exploring {direction}")
                     return
-                before = self.client.world_signature(window)
+                before = self.client.world_phase_frame(window)
                 print(f"Exploring {direction} ({step}/12)")
                 self.client.hold([keycode], 0.45)
                 time.sleep(0.35)
                 window = self.client.find_window()
-                after = self.client.world_signature(window)
-                if self.client.scene_motion_score(before, after) < 0.08:
+                after = self.client.world_phase_frame(window)
+                shift_x, shift_y, response = self.client.phase_camera_motion(before, after)
+                camera_moved = response >= 0.08 and abs(shift_x) >= 2.5
+                if self.debug:
+                    print(
+                        f"  camera phase shift=({shift_x:.2f}, {shift_y:.2f}), "
+                        f"response={response:.3f}, horizontal_motion={camera_moved}"
+                    )
+                if not camera_moved:
                     stationary_frames += 1
                     if stationary_frames >= 2:
-                        print(f"Reached {direction} camera edge")
+                        print(
+                            f"Reached {direction} camera edge "
+                            f"(no coherent horizontal camera translation)"
+                        )
                         break
                 else:
                     stationary_frames = 0

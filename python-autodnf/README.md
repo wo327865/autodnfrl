@@ -40,3 +40,11 @@ state.
 
 `capture` saves read-only game frames for a custom loot/arrow detector. See
 [dataset/README.md](dataset/README.md) for collection and annotation steps.
+
+During reward collection, the workflow lazily loads
+`runs/detector/loot_piles/weights/best.pt` and uses the highest-confidence
+detection in the playable world area to center the pile. Bottom HUD detections
+are ignored, and reward-specific OCR remains available as a fallback.
+Full-map exploration uses phase correlation on the gameplay background to
+detect horizontal camera translation and stop reliably at map edges despite
+local character animation.
