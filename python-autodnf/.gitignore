@@ -1,9 +1,13 @@
 .venv/
-dataset/images/
-dataset/labels/
-dataset/manifest.jsonl
+# Captures and hand-authored labels are training source data and are tracked.
+# `dataset/yolo` is a reproducible split made of machine-local symlinks.
 dataset/yolo/
-runs/
+# Keep trained detector checkpoints, but not large generated plots/previews.
+runs/**
+!runs/detector/
+!runs/detector/**/
+!runs/detector/**/weights/
+!runs/detector/**/weights/*.pt
 __pycache__/
 *.pyc
 captures/

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train and evaluate the initial AutoDNF YOLO detector."""
+"""Train and evaluate the AutoDNF loot-pile YOLO detector."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ import yaml
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train AutoDNF loot/arrow detector")
+    parser = argparse.ArgumentParser(description="Train AutoDNF loot-pile detector")
     parser.add_argument("--data", type=Path, default=Path("dataset/detector.yaml"))
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=4)
     parser.add_argument("--project", type=Path, default=Path("runs/detector"))
-    parser.add_argument("--name", default="loot_items")
+    parser.add_argument("--name", default="loot_piles")
     args = parser.parse_args()
 
     data_path = args.data.resolve()
