@@ -601,20 +601,28 @@ class AutoDNF:
             self.click_right_button("确认", window, boxes, "entry material confirmation")
 
     def collect_visible_rewards(self) -> None:
-        """Center a reward-text cluster when necessary, then sweep it."""
+        """Follow off-screen-loot arrows, center the pile, then sweep it."""
+        self.follow_reward_arrows()
         window = self.client.find_window()
-        center = self.reward_pile_center(self.client.ocr(window))
-        # The terms are item-specific, so a cluster near an edge is a reliable
-        # cue to walk toward the pile. Stop as soon as it is near centre.
-        for _ in range(3):
-            if center is None or 0.43 <= center[0] <= 0.57:
-                break
-            direction = 124 if center[0] > 0.57 else 123  # right / left arrow
-            print(f"Reward pile at x={center[0]:.2f}; repositioning toward screen centre")
-            self.client.hold([direction], 0.45)
-            time.sleep(0.5)
+        center = self.wait_for_reward_pile(timeout=2.4)
+        if center is None:
+            self.explore_for_rewards()
+            self.follow_reward_arrows()
             window = self.client.find_window()
-            center = self.reward_pile_center(self.client.ocr(window))
+            center = self.wait_for_reward_pile(timeout=2.4)
+        if center is not None:
+            # The terms are item-specific, so a text cluster near an edge is
+            # a reliable cue to walk toward the pile.
+            for _ in range(3):
+                if 0.43 <= center[0] <= 0.57:
+                    break
+                direction = 124 if center[0] > 0.57 else 123  # right / left arrow
+                print(f"Reward pile at x={center[0]:.2f}; repositioning toward screen centre")
+                self.client.hold([direction], 0.45)
+                time.sleep(0.5)
+                center = self.wait_for_reward_pile(timeout=1.2)
+                if center is None:
+                    break
         if center is None:
             # OCR is intentionally conservative: do not move blindly if no
             # reward-specific label can be identified.
@@ -624,20 +632,74 @@ class AutoDNF:
             self.client.spiral_drag(window, center, radius=radius, turns=3.5)
             time.sleep(0.6)
 
+    def wait_for_reward_pile(self, timeout: float) -> tuple[float, float] | None:
+        """Allow reward labels to settle after a room/result transition."""
+        deadline = time.monotonic() + timeout
+        while True:
+            window = self.client.find_window()
+            center = self.reward_pile_center(self.client.ocr(window))
+            if center is not None:
+                return center
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.4)
+
+    def follow_reward_arrows(self) -> None:
+        """Walk toward the cyan edge arrow until the remaining loot is visible."""
+        for step in range(1, 9):
+            window = self.client.find_window()
+            direction = self.client.reward_arrow_direction(window)
+            if direction is None:
+                if step > 1:
+                    print("Reward guidance arrow disappeared")
+                return
+            keycode = 124 if direction == "right" else 123
+            print(f"Following {direction} reward arrow ({step}/8)")
+            self.client.hold([keycode], 0.40)
+            time.sleep(0.35)
+        print("Reward guidance arrow still visible after 8 steps; sweeping current area")
+
+    def explore_for_rewards(self) -> None:
+        """Search right first, then left when the right camera edge is reached."""
+        print("No reward cue visible; exploring right, then left if needed")
+        for direction, keycode in (("right", 124), ("left", 123)):
+            stationary_frames = 0
+            for step in range(1, 13):
+                window = self.client.find_window()
+                if self.reward_pile_center(self.client.ocr(window)) is not None:
+                    print(f"Found reward text while exploring {direction}")
+                    return
+                if self.client.reward_arrow_direction(window) is not None:
+                    print(f"Found a reward arrow while exploring {direction}")
+                    return
+                before = self.client.world_signature(window)
+                print(f"Exploring {direction} ({step}/12)")
+                self.client.hold([keycode], 0.45)
+                time.sleep(0.35)
+                window = self.client.find_window()
+                after = self.client.world_signature(window)
+                if self.client.scene_motion_score(before, after) < 0.08:
+                    stationary_frames += 1
+                    if stationary_frames >= 2:
+                        print(f"Reached {direction} camera edge")
+                        break
+                else:
+                    stationary_frames = 0
+
     @staticmethod
     def reward_pile_center(boxes: list[TextBox]) -> tuple[float, float] | None:
         """Locate a drop pile from item-language markers supplied by the user."""
         reward_markers = (
             "[", "]", "【", "】", "角色绑定", "超武", "材料", "四维时空",
             "星核", "星源", "碎片", "神秘", "炉岩", "炭", "斯卡迪", "印章",
-            "角色", "绑定", "稀有", "源石", "石矿"
+            "角色", "绑定", "稀有", "源石", "石矿", "矛盾"
         )
         labels = [
             box for box in boxes
             # Gameplay-only region: excludes the top menus, right result
             # buttons, party panel, and the lower skill bar.
             if 0.16 < box.center[0] < 0.91 and 0.20 < box.center[1] < 0.76
-            and any(marker in box.text for marker in reward_markers)
+            and any(marker in box.normalized for marker in reward_markers)
         ]
         if not labels:
             return None

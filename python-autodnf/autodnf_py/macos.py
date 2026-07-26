@@ -67,6 +67,8 @@ class TextBox:
             .replace("\n", "")
             .replace(":", "：")
             .replace("，", ",")
+            .replace("［", "[")
+            .replace("］", "]")
         )
 
 
@@ -176,47 +178,70 @@ class MacClient:
             time.sleep(0.018)
         CGEventPost(kCGHIDEventTap, CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, (x, y), kCGMouseButtonLeft))
 
-    def visual_loot_cluster(self, window: Window) -> tuple[float, float] | None:
-        """Locate a dense gold/purple drop-label patch without reading text.
+    def reward_arrow_direction(self, window: Window) -> str | None:
+        """Return the side containing DNF's cyan off-screen-loot arrow.
 
-        The sampled region excludes the top buttons, left party panel, right
-        result buttons and bottom skill bar. It therefore cannot mistake their
-        OCR/menu text for loot. This deliberately returns ``None`` when the
-        visual evidence is weak rather than inventing a target.
+        Only narrow edge strips in the middle gameplay band are sampled. This
+        avoids the cyan dungeon scenery in the centre and the menus at top.
+        The arrow is a bright cyan cluster, while isolated particle pixels are
+        ignored by the minimum count threshold.
         """
         image = self.screenshot(window)
         bitmap = NSBitmapImageRep.alloc().initWithCGImage_(image)
         width, height = int(bitmap.pixelsWide()), int(bitmap.pixelsHigh())
-        stride = 10
-        points: list[tuple[int, int]] = []
-        # NSBitmapImageRep coordinates and Vision both use a bottom-left
-        # orientation for this representation.
-        for y in range(int(height * 0.25), int(height * 0.70), stride):
-            for x in range(int(width * 0.20), int(width * 0.88), stride):
+
+        def cyan_count(start_x: int, end_x: int) -> int:
+            count = 0
+            for y in range(int(height * 0.27), int(height * 0.73), 5):
+                for x in range(start_x, end_x, 5):
+                    color = bitmap.colorAtX_y_(x, y)
+                    if color is None:
+                        continue
+                    rgb = color.colorUsingColorSpaceName_("NSDeviceRGBColorSpace") or color
+                    red, green, blue = rgb.redComponent(), rgb.greenComponent(), rgb.blueComponent()
+                    if blue > 0.55 and green > 0.42 and red < 0.42 and blue - red > 0.30:
+                        count += 1
+            return count
+
+        # 7% edge strips keep clear of the party panel and result buttons.
+        left = cyan_count(int(width * 0.01), int(width * 0.08))
+        right = cyan_count(int(width * 0.92), int(width * 0.99))
+        threshold = 9
+        if right >= threshold and right > left * 1.35:
+            return "right"
+        if left >= threshold and left > right * 1.35:
+            return "left"
+        return None
+
+    def world_signature(self, window: Window) -> bytes:
+        """Small colour signature of the camera-dependent gameplay backdrop."""
+        image = self.screenshot(window)
+        bitmap = NSBitmapImageRep.alloc().initWithCGImage_(image)
+        width, height = int(bitmap.pixelsWide()), int(bitmap.pixelsHigh())
+        values = bytearray()
+        # Avoid character/HUD-heavy edges; a camera scroll changes many of
+        # these background samples, while idle animation changes very few.
+        for y in range(int(height * 0.29), int(height * 0.67), 28):
+            for x in range(int(width * 0.16), int(width * 0.84), 28):
                 color = bitmap.colorAtX_y_(x, y)
                 if color is None:
+                    values.extend((0, 0, 0))
                     continue
                 rgb = color.colorUsingColorSpaceName_("NSDeviceRGBColorSpace") or color
-                red, green, blue = rgb.redComponent(), rgb.greenComponent(), rgb.blueComponent()
-                gold = red > 0.58 and green > 0.34 and blue < 0.40 and red + green > 1.25
-                purple = red > 0.42 and blue > 0.36 and green < 0.50
-                if gold or purple:
-                    points.append((x, y))
-        if len(points) < 12:
-            return None
-        # Reward labels overlap heavily, producing a much denser patch than
-        # isolated animation pixels. Pick the densest 120px neighbourhood.
-        radius_sq = 120 * 120
-        cluster = max(
-            ([other for other in points if (other[0] - seed[0]) ** 2 + (other[1] - seed[1]) ** 2 <= radius_sq] for seed in points),
-            key=len,
-        )
-        if len(cluster) < 12:
-            return None
-        return (
-            sum(x for x, _ in cluster) / len(cluster) / width,
-            sum(y for _, y in cluster) / len(cluster) / height,
-        )
+                values.extend((
+                    int(rgb.redComponent() * 7),
+                    int(rgb.greenComponent() * 7),
+                    int(rgb.blueComponent() * 7),
+                ))
+        return bytes(values)
+
+    @staticmethod
+    def scene_motion_score(before: bytes, after: bytes) -> float:
+        """Return proportion of sampled colour channels changed by a scroll."""
+        if not before or len(before) != len(after):
+            return 1.0
+        changed = sum(abs(left - right) >= 2 for left, right in zip(before, after))
+        return changed / len(before)
 
     def press(self, keycode: int, duration: float = 0.15) -> None:
         if not self.execute:
