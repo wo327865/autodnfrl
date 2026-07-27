@@ -32,6 +32,7 @@ from Quartz import (
     kCGEventLeftMouseDragged,
     kCGEventLeftMouseUp,
     kCGEventSourceStateCombinedSessionState,
+    CGRectMake,
 )
 from Vision import (
     VNRecognizeTextRequest,
@@ -194,10 +195,27 @@ class MacClient:
             path.unlink(missing_ok=True)
 
     def ocr(self, window: Window) -> list[TextBox]:
+        return self._ocr(window)
+
+    def ocr_region(
+        self,
+        window: Window,
+        region: tuple[float, float, float, float],
+    ) -> list[TextBox]:
+        """OCR one Vision-normalized region instead of the whole window."""
+        return self._ocr(window, region)
+
+    def _ocr(
+        self,
+        window: Window,
+        region: tuple[float, float, float, float] | None = None,
+    ) -> list[TextBox]:
         request = VNRecognizeTextRequest.alloc().init()
         request.setRecognitionLevel_(VNRequestTextRecognitionLevelAccurate)
         request.setRecognitionLanguages_(["zh-Hans", "en-US"])
         request.setUsesLanguageCorrection_(True)
+        if region is not None:
+            request.setRegionOfInterest_(CGRectMake(*region))
         handler = VNImageRequestHandler.alloc().initWithCGImage_options_(self.screenshot(window), {})
         handler.performRequests_error_([request], None)
         result: list[TextBox] = []

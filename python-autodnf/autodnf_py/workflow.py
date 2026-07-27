@@ -257,6 +257,16 @@ class AutoDNF:
         round_number = 1
         while True:
             current_fatigue = self.wait_for_town_fatigue()
+            if current_fatigue is None:
+                # The compact HUD occasionally disappears behind a transition
+                # or is read incorrectly by OCR. The character board uses
+                # large fatigue labels, so it is the safer fallback than
+                # aborting the entire daily run.
+                print("Town fatigue HUD was unreadable; checking the character board instead")
+                if not self.switch_to_available_character():
+                    print("No character with at least 10 fatigue was found. Automation complete.")
+                    return
+                continue
             if current_fatigue < 10:
                 print(
                     f"Current character has only {current_fatigue}/100 fatigue; "
@@ -275,33 +285,52 @@ class AutoDNF:
                 return
             round_number += 1
 
-    def wait_for_town_fatigue(self, timeout: float = 12) -> int:
-        """Read the current character's top-left fatigue display in town."""
+    def wait_for_town_fatigue(self, timeout: float = 30) -> int | None:
+        """Read town fatigue, using focused HUD OCR as a fallback to full-screen OCR."""
         window, boxes = self.wait_for(["委托", "选角"], "town character controls", timeout=60)
         deadline = time.monotonic() + timeout
+        attempts = 0
         while True:
             fatigue = self.town_fatigue(boxes)
             if fatigue is not None:
                 print(f"Detected town character fatigue: {fatigue}/100")
                 return fatigue
+            # The fatigue text is small and sometimes obscured by animation.
+            # Restricting Vision to the top-left HUD gives it far less unrelated
+            # text to confuse with a /100 value.
+            hud_boxes = self.client.ocr_region(window, (0.00, 0.70, 0.35, 0.30))
+            fatigue = self.town_fatigue(hud_boxes, restrict_to_town_hud=False)
+            if fatigue is not None:
+                print(f"Detected town character fatigue with focused HUD OCR: {fatigue}/100")
+                return fatigue
             if time.monotonic() >= deadline:
-                raise RuntimeError("Could not read current character fatigue from the town HUD")
-            time.sleep(0.5)
+                print("Could not read current character fatigue from the town HUD after focused retries")
+                return None
+            attempts += 1
+            if attempts == 1 or attempts % 5 == 0:
+                print(f"Town fatigue OCR retry {attempts}; waiting for a stable HUD frame")
+            time.sleep(0.6)
             window = self.client.find_window()
             boxes = self.client.ocr(window)
 
     @staticmethod
-    def town_fatigue(boxes: list[TextBox]) -> int | None:
+    def town_fatigue(boxes: list[TextBox], restrict_to_town_hud: bool = True) -> int | None:
         readings: list[tuple[TextBox, int]] = []
         for box in boxes:
-            match = re.fullmatch(r"([0-9]{1,3})/100", box.normalized)
+            # Vision may confuse O/0 or omit spacing around the slash. Accept
+            # those harmless variants, but only in the known HUD region when
+            # searching a full screen.
+            normalized = box.normalized.upper().replace("O", "0").replace("I", "1")
+            match = re.search(r"(?<![0-9])([0-9]{1,3})\s*[/|]?\s*100(?![0-9])", normalized)
             if (
                 match
                 and 0 <= int(match.group(1)) <= 100
                 # Current-character HUD is in the upper-left of the town
                 # window. Restricting the region avoids unrelated /100 text.
-                and box.center[0] < 0.32
-                and box.center[1] > 0.72
+                and (
+                    not restrict_to_town_hud
+                    or (box.center[0] < 0.32 and box.center[1] > 0.72)
+                )
             ):
                 readings.append((box, int(match.group(1))))
         if not readings:
