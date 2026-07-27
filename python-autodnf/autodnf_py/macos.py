@@ -227,12 +227,91 @@ class MacClient:
         finally:
             CGEventPost(kCGHIDEventTap, up)
 
-    def spiral_drag(self, window: Window, center: tuple[float, float], radius: float = 0.19, turns: float = 3.5) -> None:
-        """Hold left mouse and sweep outward to collect a compact loot pile."""
+    def drag(
+        self,
+        window: Window,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        label: str,
+        duration: float = 0.7,
+        steps: int = 28,
+    ) -> None:
+        """Drag from one Vision-normalized point to another with left mouse held."""
+        start_screen = self._screen_point(window, start)
+        end_screen = self._screen_point(window, end)
+        print(
+            f"{'drag' if self.execute else '[dry-run] drag'} {label} "
+            f"from ({start_screen[0]:.0f}, {start_screen[1]:.0f}) "
+            f"to ({end_screen[0]:.0f}, {end_screen[1]:.0f})"
+        )
+        if not self.execute:
+            return
+        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(window.pid)
+        if app:
+            app.activateWithOptions_(1)
+            time.sleep(0.12)
+        current = start_screen
+        CGEventPost(
+            kCGHIDEventTap,
+            CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, start_screen, kCGMouseButtonLeft),
+        )
+        try:
+            for step in range(1, steps + 1):
+                progress = step / steps
+                current = (
+                    start_screen[0] + (end_screen[0] - start_screen[0]) * progress,
+                    start_screen[1] + (end_screen[1] - start_screen[1]) * progress,
+                )
+                CGEventPost(
+                    kCGHIDEventTap,
+                    CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, current, kCGMouseButtonLeft),
+                )
+                time.sleep(duration / steps)
+        finally:
+            CGEventPost(
+                kCGHIDEventTap,
+                CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, current, kCGMouseButtonLeft),
+            )
+
+    @staticmethod
+    def region_difference(
+        before: bytes,
+        after: bytes,
+        region: tuple[float, float, float, float],
+    ) -> float | None:
+        """Mean grayscale change in a top-left-origin normalized image region."""
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            return None
+        first = cv2.imdecode(np.frombuffer(before, np.uint8), cv2.IMREAD_GRAYSCALE)
+        second = cv2.imdecode(np.frombuffer(after, np.uint8), cv2.IMREAD_GRAYSCALE)
+        if first is None or second is None or first.shape != second.shape:
+            return None
+        height, width = first.shape
+        left, top, right, bottom = region
+        x0, x1 = round(left * width), round(right * width)
+        y0, y1 = round(top * height), round(bottom * height)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return float(cv2.absdiff(first[y0:y1, x0:x1], second[y0:y1, x0:x1]).mean())
+
+    def spiral_drag(
+        self,
+        window: Window,
+        center: tuple[float, float],
+        radius: float = 0.28,
+        turns: float = 4.5,
+        steps: int = 180,
+        step_delay: float = 0.025,
+    ) -> None:
+        """Hold left mouse for one slow, wide outward loot-collection spiral."""
         screen_x, screen_y = self._screen_point(window, center)
         print(
             f"{'spiral-drag' if self.execute else '[dry-run] spiral-drag'} reward pile "
-            f"at ({screen_x:.0f}, {screen_y:.0f}), radius {radius * window.width:.0f}px"
+            f"at ({screen_x:.0f}, {screen_y:.0f}), radius {radius * window.width:.0f}px, "
+            f"{turns:.1f} turns over {steps * step_delay:.1f}s"
         )
         if not self.execute:
             return
@@ -244,9 +323,9 @@ class MacClient:
         CGEventPost(kCGHIDEventTap, CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, start, kCGMouseButtonLeft))
         current = start
         try:
-            # Increasing radius keeps the first sweep tight around the pile,
-            # then reaches drops scattered around its edge.
-            steps = 100
+            # Begin at the detected pile centre and expand gradually.  This
+            # single pass is deliberately slow enough for the game to register
+            # each crossed reward, while the final radius reaches stragglers.
             for step in range(1, steps + 1):
                 progress = step / steps
                 angle = progress * turns * 2 * 3.141592653589793
@@ -255,7 +334,7 @@ class MacClient:
                 current = (x, y)
                 event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, current, kCGMouseButtonLeft)
                 CGEventPost(kCGHIDEventTap, event)
-                time.sleep(0.018)
+                time.sleep(step_delay)
         finally:
             CGEventPost(
                 kCGHIDEventTap,

@@ -219,7 +219,7 @@ class AutoDNF:
         names = ", ".join(next_states)
         raise TimeoutError(f"{text} did not reach: {names}")
 
-    def run_to_party(self, battle: bool = False) -> None:
+    def run_to_party(self, battle: bool = False) -> bool:
         self.click_then_wait(
             "委托",
             "main screen",
@@ -250,7 +250,7 @@ class AutoDNF:
                 state = self.confirm_travel()
         if state != "realm selection":
             raise RuntimeError(f"Unexpected travel result: {state}")
-        self.continue_from_realm_selection(battle)
+        return self.continue_from_realm_selection(battle)
 
     def run_all_characters(self) -> None:
         """Run the dungeon, then rotate through every character with fatigue."""
@@ -270,7 +270,9 @@ class AutoDNF:
                 continue
             print(f"Current character has {current_fatigue}/100 fatigue; continuing to 委托")
             print(f"Starting character round {round_number}")
-            self.run_to_party(battle=True)
+            if not self.run_to_party(battle=True):
+                print("No eligible party companion remained. Automation complete.")
+                return
             round_number += 1
 
     def wait_for_town_fatigue(self, timeout: float = 12) -> int:
@@ -322,8 +324,10 @@ class AutoDNF:
             timeout=15,
         )
 
-        board_deadline = time.monotonic() + 8
+        board_deadline = time.monotonic() + 90
         stable_empty_frames = 0
+        unchanged_scrolls = 0
+        scrolls = 0
         while True:
             fatigue_rows = [
                 (box, int(match.group(1)))
@@ -334,11 +338,13 @@ class AutoDNF:
             ]
             available = sorted(
                 ((fatigue, box.center[1]) for box, fatigue in fatigue_rows if fatigue >= 10),
-                key=lambda item: (-item[0], -item[1]),
+                # Pick the first visible available role rather than ranking
+                # power/fatigue: scroll order is predictable across accounts.
+                key=lambda item: -item[1],
             )
             if available:
                 fatigue, row_y = available[0]
-                print(f"Selecting character with {fatigue}/100 fatigue from the first board page")
+                print(f"Selecting first visible character with {fatigue}/100 fatigue")
                 self.client.click(window, (0.45, row_y), f"available character ({fatigue}/100)")
                 time.sleep(0.8)
                 window = self.client.find_window()
@@ -353,18 +359,50 @@ class AutoDNF:
                 return True
 
             # The title/button can render before the rows. Require two
-            # complete-looking OCR frames before concluding the first page has
-            # no eligible role. Never click the board's right-page arrow.
+            # complete-looking OCR frames before treating the current view as
+            # exhausted. Then drag the card list upward to scroll downward.
             if len(fatigue_rows) >= 3:
                 stable_empty_frames += 1
             else:
                 stable_empty_frames = 0
             if stable_empty_frames >= 2:
-                print("First character-board page has no role with fatigue >= 10")
-                return False
+                if scrolls >= 30:
+                    print("Stopped character-board search after 30 downward scrolls without an eligible role")
+                    return False
+                before = self.client.capture_png_bytes(window)
+                scrolls += 1
+                print(f"No available fatigue on this view; scrolling character list down ({scrolls})")
+                # Vision coordinates use a bottom-left origin. Moving from
+                # y=.34 to y=.72 therefore drags physically upward, matching
+                # the game's character-list scroll gesture.
+                self.client.drag(
+                    window,
+                    start=(0.50, 0.34),
+                    end=(0.50, 0.72),
+                    label="character list downward",
+                )
+                time.sleep(0.7)
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                after = self.client.capture_png_bytes(window)
+                difference = self.client.region_difference(before, after, (0.12, 0.25, 0.88, 0.82))
+                if difference is not None and difference < 2.5:
+                    unchanged_scrolls += 1
+                    print(f"Character list did not move (difference {difference:.2f}; {unchanged_scrolls}/2)")
+                else:
+                    unchanged_scrolls = 0
+                    if difference is None:
+                        print("Character-list movement could not be measured; continuing with OCR")
+                    else:
+                        print(f"Character list moved (difference {difference:.2f})")
+                if unchanged_scrolls >= 2:
+                    print("Reached the bottom of the character list; no role has at least 10 fatigue")
+                    return False
+                stable_empty_frames = 0
+                continue
             if time.monotonic() >= board_deadline:
                 print(
-                    "Timed out reading an eligible role on the first character-board page "
+                    "Timed out reading an eligible role while searching the character board "
                     f"(last frame contained {len(fatigue_rows)} fatigue value(s))"
                 )
                 return False
@@ -372,18 +410,20 @@ class AutoDNF:
             window = self.client.find_window()
             boxes = self.client.ocr(window)
 
-    def continue_from_realm_selection(self, battle: bool = False) -> None:
+    def continue_from_realm_selection(self, battle: bool = False) -> bool:
         self.click_then_wait(
             "普通秘境",
             "realm selection",
             ["普通秘境", "时空秘境"],
             {"party setup": ["普通秘境", "入场材料"]},
         )
-        self.configure_party()
+        if not self.configure_party():
+            return False
         if battle:
             self.run_battle(start_by_entering=True)
         else:
             print("Party setup complete. Use --battle to enter the dungeon automatically.")
+        return True
 
     def wait_for_realm_selection(self, timeout: float) -> str:
         # The three cards can vary by game version/account.  Any two stable
@@ -430,7 +470,7 @@ class AutoDNF:
             self.wait_for(["时空秘境", "返回城镇"], "时空秘境 town", timeout=5)
             return "时空秘境 town"
 
-    def configure_party(self) -> None:
+    def configure_party(self) -> bool:
         deadline = time.monotonic() + 8
         slot_point: tuple[float, float] | None = None
         current_fatigue: int | None = None
@@ -461,7 +501,7 @@ class AutoDNF:
             )
             if party_fatigue >= 3 or party_power >= 3:
                 print("Detected an existing three-character formation")
-                return
+                return True
             if slots:
                 slot_point = (slots[0].center[0], 0.58)
                 break
@@ -493,86 +533,92 @@ class AutoDNF:
                 print(f"Party picker did not open; retrying ({attempt}/3)")
         else:
             raise TimeoutError("Could not open party character picker")
-        # The crowned main character is not labelled 选择完成.  We need two
-        # companions. Vision can read the label before a click but often misses
-        # its bright green post-click rendering, so it is advisory rather than
-        # a required state transition.
-        # The modal title and button render before the animated card contents.
-        # Do not treat the first OCR frame as a complete picker: wait until
-        # enough cards have a readable, usable fatigue value.
-        card_deadline = time.monotonic() + 8
-        enough_cards_since: float | None = None
-        candidates_by_point: dict[tuple[float, float], tuple[int, tuple[float, float]]] = {}
+        # The crowned main character is not labelled 选择完成. Select two
+        # companions in visual order. If a visible picker page is exhausted,
+        # drag its card list upward to inspect the next page; never assume all
+        # possible companions fit in the initial three rows.
+        companions_selected = len(find("选择完成", boxes))
+        card_deadline = time.monotonic() + 12
+        scrolls = 0
+        unchanged_scrolls = 0
+        attempted_points: set[tuple[float, float]] = set()
         announced_card_wait = False
-        while True:
-            selected = len(find("选择完成", boxes))
-            needed = max(0, 2 - selected)
-            frame_candidates = self.eligible_cards(
-                boxes,
-                target_fatigue=current_fatigue,
-                emit_debug=False,
-            )
-            for candidate in frame_candidates:
-                candidates_by_point[candidate[1]] = candidate
-            candidates = sorted(
-                candidates_by_point.values(),
-                key=lambda candidate: self.card_sort_key(candidate, current_fatigue),
-            )
-
-            now = time.monotonic()
-            if len(candidates) >= needed:
-                if enough_cards_since is None:
-                    enough_cards_since = now
-                # Do not immediately use the first readable row. Vision often
-                # recognizes the partially covered bottom row one frame before
-                # the fully visible middle row. Combine frames briefly so row
-                # two wins the normal top-to-bottom ordering.
-                if now - enough_cards_since >= 2:
-                    break
-            if now >= card_deadline:
-                if len(candidates) >= needed:
-                    break
-                # Emit the final OCR details once, rather than flooding debug
-                # output for every incomplete animation frame.
-                self.eligible_cards(
+        while companions_selected < 2:
+            candidates = [
+                candidate
+                for candidate in self.eligible_cards(
                     boxes,
                     target_fatigue=current_fatigue,
-                    emit_debug=True,
+                    emit_debug=False,
                 )
-                raise RuntimeError(
-                    f"Could not locate enough visible character cards "
-                    f"(needed {needed}, found {len(candidates)})"
-                )
-            if not announced_card_wait:
-                print("Character cards are still rendering; waiting for readable fatigue values")
-                announced_card_wait = True
-            time.sleep(0.5)
+                if candidate[1] not in attempted_points
+            ]
+            if candidates:
+                fatigue, point = candidates[0]
+                slot = companions_selected + 1
+                print(f"Selecting visible party companion {slot} with {fatigue}/100 fatigue")
+                self.client.click(window, point, f"eligible character for companion slot {slot}")
+                attempted_points.add(point)
+                companions_selected += 1
+                time.sleep(0.7)
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                observed = len(find("选择完成", boxes))
+                if observed < companions_selected:
+                    print("Selection marker was not OCR-visible after click; card was fatigue-verified before clicking")
+                continue
+
+            # Allow the animated cards to finish rendering before deciding that
+            # their visible fatigue values are all exhausted.
+            numeric_values = [
+                box
+                for box in boxes
+                if re.fullmatch(r"[0-9]{1,3}", box.normalized)
+                and 0.14 < box.center[0] < 0.88
+                and 0.15 < box.center[1] < 0.72
+            ]
+            if len(numeric_values) < 3 and time.monotonic() < card_deadline:
+                if not announced_card_wait:
+                    print("Character cards are still rendering; waiting for readable fatigue values")
+                    announced_card_wait = True
+                time.sleep(0.5)
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                continue
+
+            if scrolls >= 30:
+                print("No eligible party character found after 30 downward scrolls")
+                return False
+            before = self.client.capture_png_bytes(window)
+            scrolls += 1
+            print(f"No eligible companion on this picker view; scrolling down ({scrolls})")
+            self.client.drag(
+                window,
+                start=(0.50, 0.30),
+                end=(0.50, 0.70),
+                label="party character list downward",
+            )
+            time.sleep(0.7)
             window = self.client.find_window()
             boxes = self.client.ocr(window)
-        if self.debug:
-            # Print the candidates accumulated from the settled OCR frames.
-            column_name = ("left", "middle", "right")
-            print(f"Party picker debug: {selected} companion(s) already selected")
-            for card_fatigue, point in candidates:
-                card_column = 0 if point[0] < 0.39 else 1 if point[0] < 0.65 else 2
-                row = 1 if point[1] > 0.50 else 2 if point[1] > 0.34 else 3
-                difference = (
-                    f", difference {abs(card_fatigue - current_fatigue)}"
-                    if current_fatigue is not None
-                    else ""
-                )
-                print(
-                    f"  usable card: row {row}, {column_name[card_column]}, "
-                    f"fatigue {card_fatigue}{difference} "
-                    f"(normalized {point[0]:.3f}, {point[1]:.3f})"
-                )
-        for index, (_, point) in enumerate(candidates[:needed], start=1):
-            self.client.click(window, point, f"eligible character for companion slot {selected + index}")
-            time.sleep(0.7)
-            boxes = self.client.ocr(window)
-            observed = len(find("选择完成", boxes))
-            if observed < selected + index:
-                print("Selection marker was not OCR-visible after click; card was fatigue-verified before clicking")
+            after = self.client.capture_png_bytes(window)
+            difference = self.client.region_difference(before, after, (0.13, 0.25, 0.88, 0.80))
+            if difference is not None and difference < 2.5:
+                unchanged_scrolls += 1
+                print(f"Party picker did not move (difference {difference:.2f}; {unchanged_scrolls}/2)")
+            else:
+                unchanged_scrolls = 0
+                if difference is None:
+                    print("Party-picker movement could not be measured; continuing with OCR")
+                else:
+                    print(f"Party picker moved (difference {difference:.2f})")
+            if unchanged_scrolls >= 2:
+                self.eligible_cards(boxes, target_fatigue=current_fatigue, emit_debug=True)
+                print("Reached the bottom of the party character list with no eligible companion")
+                return False
+            # Coordinates are reused after a list scroll, so candidates from
+            # the old page must not block the new page's top-left card.
+            attempted_points.clear()
         complete = exact("编队完成", boxes)
         if len(complete) != 1:
             raise RuntimeError("Could not identify formation-complete button")
@@ -595,7 +641,7 @@ class AutoDNF:
                 time.sleep(0.4)
             if picker_absent_frames >= 2:
                 print("Party formation saved")
-                return
+                return True
             print(f"编队完成 did not close the picker; retrying ({attempt}/3)")
             complete = exact("编队完成", boxes)
             if len(complete) != 1:
@@ -759,9 +805,9 @@ class AutoDNF:
             # Do not move blindly after the full model/OCR map search.
             center = (0.58, 0.43)
             print("No model/OCR pile detected; sweeping central world area without moving")
-        for radius in (0.12, 0.18):
-            self.client.spiral_drag(window, center, radius=radius, turns=3.5)
-            time.sleep(0.6)
+        # One slow, wide spiral is more reliable than two fast passes: it
+        # avoids releasing the collection drag between adjacent rewards.
+        self.client.spiral_drag(window, center, radius=0.28, turns=4.5)
 
     def wait_for_reward_pile(self, timeout: float) -> tuple[float, float] | None:
         """Require a second pile observation after a short drop-settling delay."""
@@ -948,9 +994,8 @@ class AutoDNF:
                 usable_fatigue = max(fatigue_values, default=0)
                 if not is_selected and not is_blocked and usable_fatigue > 0:
                     candidates.append((usable_fatigue, (x, y + 0.035)))
-        # Prefer fatigue closest to the current character so the party reaches
-        # its limit together. Vision's top-to-bottom, left-to-right grid order
-        # remains the deterministic tie-breaker.
+        # Use deterministic visual order: top-left to right, then the next
+        # row. Character names/power differ between accounts and are ignored.
         candidates = sorted(
             candidates,
             key=lambda candidate: self.card_sort_key(candidate, target_fatigue),
@@ -985,7 +1030,6 @@ class AutoDNF:
     def card_sort_key(
         candidate: tuple[int, tuple[float, float]],
         target_fatigue: int | None,
-    ) -> tuple[int, float, float]:
-        fatigue, point = candidate
-        difference = abs(fatigue - target_fatigue) if target_fatigue is not None else 0
-        return difference, -point[1], point[0]
+    ) -> tuple[float, float]:
+        _, point = candidate
+        return -point[1], point[0]
