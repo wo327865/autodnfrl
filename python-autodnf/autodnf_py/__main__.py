@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .macos import MacClient
+from .macos import GlobalStopShortcut, MacClient
 from .workflow import AutoDNF
 
 
@@ -25,45 +25,56 @@ def main() -> None:
 
     client = MacClient(args.window, args.execute)
     flow = AutoDNF(client, debug=args.debug)
-    if args.command == "scan":
-        window = client.find_window()
-        for box in sorted(client.ocr(window), key=lambda item: -item.center[1]):
-            print(f"({box.center[0]:.3f}, {box.center[1]:.3f}) {box.text}")
-    elif args.command == "capture":
-        if args.count < 1:
-            parser.error("--count must be at least 1")
-        output = Path(args.output)
-        manifest = output.parent / "manifest.jsonl"
-        for index in range(args.count):
+    shortcut = GlobalStopShortcut()
+    shortcut.start()
+    print("Press Control+T at any time to stop AutoDNF.")
+    try:
+        if args.command == "scan":
             window = client.find_window()
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-            image_path = output / f"{args.tag}_{stamp}.png"
-            client.capture_png(window, image_path)
-            record = {
-                "image": str(image_path),
-                "tag": args.tag,
-                "captured_at": datetime.now(timezone.utc).isoformat(),
-                "window": {"width": window.width, "height": window.height},
-            }
-            manifest.parent.mkdir(parents=True, exist_ok=True)
-            with manifest.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-            print(f"Captured {image_path}")
-            if index + 1 < args.count:
-                time.sleep(max(0.0, args.interval))
-    elif args.command == "run":
-        if args.battle:
-            flow.run_all_characters()
+            for box in sorted(client.ocr(window), key=lambda item: -item.center[1]):
+                print(f"({box.center[0]:.3f}, {box.center[1]:.3f}) {box.text}")
+        elif args.command == "capture":
+            if args.count < 1:
+                parser.error("--count must be at least 1")
+            output = Path(args.output)
+            manifest = output.parent / "manifest.jsonl"
+            for index in range(args.count):
+                window = client.find_window()
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+                image_path = output / f"{args.tag}_{stamp}.png"
+                client.capture_png(window, image_path)
+                record = {
+                    "image": str(image_path),
+                    "tag": args.tag,
+                    "captured_at": datetime.now(timezone.utc).isoformat(),
+                    "window": {"width": window.width, "height": window.height},
+                }
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                with manifest.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+                print(f"Captured {image_path}")
+                if index + 1 < args.count:
+                    time.sleep(max(0.0, args.interval))
+        elif args.command == "run":
+            if args.battle:
+                flow.run_all_characters()
+            else:
+                flow.run_to_party(battle=False)
+        elif args.command == "realm":
+            flow.continue_from_realm_selection(battle=args.battle)
+        elif args.command == "party":
+            flow.configure_party()
+            if args.battle:
+                flow.run_battle(start_by_entering=True)
         else:
-            flow.run_to_party(battle=False)
-    elif args.command == "realm":
-        flow.continue_from_realm_selection(battle=args.battle)
-    elif args.command == "party":
-        flow.configure_party()
-        if args.battle:
-            flow.run_battle(start_by_entering=True)
-    else:
-        flow.run_battle(start_by_entering=False)
+            flow.run_battle(start_by_entering=False)
+    except KeyboardInterrupt:
+        if shortcut.triggered:
+            print("\nControl+T pressed. AutoDNF stopped.")
+        else:
+            print("\nAutoDNF interrupted.")
+    finally:
+        shortcut.close()
 
 
 if __name__ == "__main__":

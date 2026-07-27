@@ -4,14 +4,18 @@ import subprocess
 import tempfile
 import time
 import math
+import os
+import signal
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from AppKit import NSBitmapImageRep, NSImage, NSRunningApplication
+from AppKit import NSImage, NSRunningApplication
 from Quartz import (
     CGEventCreateKeyboardEvent,
     CGEventCreateMouseEvent,
+    CGEventSourceKeyState,
     CGEventPost,
     CGWindowListCopyWindowInfo,
     kCGHIDEventTap,
@@ -27,6 +31,7 @@ from Quartz import (
     kCGEventLeftMouseDown,
     kCGEventLeftMouseDragged,
     kCGEventLeftMouseUp,
+    kCGEventSourceStateCombinedSessionState,
 )
 from Vision import (
     VNRecognizeTextRequest,
@@ -70,6 +75,57 @@ class TextBox:
             .replace("［", "[")
             .replace("］", "]")
         )
+
+
+class GlobalStopShortcut:
+    """Poll the global Control+T chord and interrupt the main workflow."""
+
+    # macOS hardware keycodes: T, left Control, right Control.
+    T_KEY = 17
+    CONTROL_KEYS = (59, 62)
+
+    def __init__(self, interval: float = 0.05) -> None:
+        self.interval = interval
+        self.triggered = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._monitor,
+            name="autodnf-stop-shortcut",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.25)
+
+    @classmethod
+    def is_pressed(cls) -> bool:
+        state = kCGEventSourceStateCombinedSessionState
+        return bool(CGEventSourceKeyState(state, cls.T_KEY)) and any(
+            CGEventSourceKeyState(state, key) for key in cls.CONTROL_KEYS
+        )
+
+    def _monitor(self) -> None:
+        was_pressed = False
+        while not self._stop.wait(self.interval):
+            try:
+                pressed = self.is_pressed()
+            except Exception:
+                # Input methods can briefly disappear during app/login
+                # transitions. Keep monitoring rather than stopping the run.
+                pressed = False
+            if pressed and not was_pressed:
+                self.triggered = True
+                os.kill(os.getpid(), signal.SIGINT)
+                return
+            was_pressed = pressed
 
 
 class MacClient:
@@ -156,8 +212,10 @@ class MacClient:
         down = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, (screen_x, screen_y), kCGMouseButtonLeft)
         up = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, (screen_x, screen_y), kCGMouseButtonLeft)
         CGEventPost(kCGHIDEventTap, down)
-        time.sleep(0.07)
-        CGEventPost(kCGHIDEventTap, up)
+        try:
+            time.sleep(0.07)
+        finally:
+            CGEventPost(kCGHIDEventTap, up)
 
     def spiral_drag(self, window: Window, center: tuple[float, float], radius: float = 0.19, turns: float = 3.5) -> None:
         """Hold left mouse and sweep outward to collect a compact loot pile."""
@@ -174,75 +232,25 @@ class MacClient:
             time.sleep(0.12)
         start = (screen_x, screen_y)
         CGEventPost(kCGHIDEventTap, CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, start, kCGMouseButtonLeft))
-        # Increasing radius keeps the first sweep tight around the pile, then
-        # reaches drops scattered around its edge.
-        steps = 100
-        for step in range(1, steps + 1):
-            progress = step / steps
-            angle = progress * turns * 2 * 3.141592653589793
-            x = screen_x + (radius * progress * window.width) * math.cos(angle)
-            y = screen_y - (radius * progress * window.width) * math.sin(angle)
-            event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, (x, y), kCGMouseButtonLeft)
-            CGEventPost(kCGHIDEventTap, event)
-            time.sleep(0.018)
-        CGEventPost(kCGHIDEventTap, CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, (x, y), kCGMouseButtonLeft))
-
-    def reward_arrow_direction(self, window: Window) -> str | None:
-        """Return the side containing DNF's cyan off-screen-loot arrow.
-
-        Only narrow edge strips in the middle gameplay band are sampled. This
-        avoids the cyan dungeon scenery in the centre and the menus at top.
-        The arrow is a bright cyan cluster, while isolated particle pixels are
-        ignored by the minimum count threshold.
-        """
-        image = self.screenshot(window)
-        bitmap = NSBitmapImageRep.alloc().initWithCGImage_(image)
-        width, height = int(bitmap.pixelsWide()), int(bitmap.pixelsHigh())
-
-        def cyan_count(start_x: int, end_x: int) -> int:
-            count = 0
-            for y in range(int(height * 0.27), int(height * 0.73), 5):
-                for x in range(start_x, end_x, 5):
-                    color = bitmap.colorAtX_y_(x, y)
-                    if color is None:
-                        continue
-                    rgb = color.colorUsingColorSpaceName_("NSDeviceRGBColorSpace") or color
-                    red, green, blue = rgb.redComponent(), rgb.greenComponent(), rgb.blueComponent()
-                    if blue > 0.55 and green > 0.42 and red < 0.42 and blue - red > 0.30:
-                        count += 1
-            return count
-
-        # 7% edge strips keep clear of the party panel and result buttons.
-        left = cyan_count(int(width * 0.01), int(width * 0.08))
-        right = cyan_count(int(width * 0.92), int(width * 0.99))
-        threshold = 9
-        if right >= threshold and right > left * 1.35:
-            return "right"
-        if left >= threshold and left > right * 1.35:
-            return "left"
-        return None
-
-    def world_signature(self, window: Window) -> bytes:
-        """Small colour signature of the camera-dependent gameplay backdrop."""
-        image = self.screenshot(window)
-        bitmap = NSBitmapImageRep.alloc().initWithCGImage_(image)
-        width, height = int(bitmap.pixelsWide()), int(bitmap.pixelsHigh())
-        values = bytearray()
-        # Avoid character/HUD-heavy edges; a camera scroll changes many of
-        # these background samples, while idle animation changes very few.
-        for y in range(int(height * 0.29), int(height * 0.67), 28):
-            for x in range(int(width * 0.16), int(width * 0.84), 28):
-                color = bitmap.colorAtX_y_(x, y)
-                if color is None:
-                    values.extend((0, 0, 0))
-                    continue
-                rgb = color.colorUsingColorSpaceName_("NSDeviceRGBColorSpace") or color
-                values.extend((
-                    int(rgb.redComponent() * 7),
-                    int(rgb.greenComponent() * 7),
-                    int(rgb.blueComponent() * 7),
-                ))
-        return bytes(values)
+        current = start
+        try:
+            # Increasing radius keeps the first sweep tight around the pile,
+            # then reaches drops scattered around its edge.
+            steps = 100
+            for step in range(1, steps + 1):
+                progress = step / steps
+                angle = progress * turns * 2 * 3.141592653589793
+                x = screen_x + (radius * progress * window.width) * math.cos(angle)
+                y = screen_y - (radius * progress * window.width) * math.sin(angle)
+                current = (x, y)
+                event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, current, kCGMouseButtonLeft)
+                CGEventPost(kCGHIDEventTap, event)
+                time.sleep(0.018)
+        finally:
+            CGEventPost(
+                kCGHIDEventTap,
+                CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, current, kCGMouseButtonLeft),
+            )
 
     def world_phase_frame(self, window: Window):
         """Return a reduced grayscale world crop for phase correlation.
@@ -297,14 +305,6 @@ class MacClient:
         (shift_x, shift_y), response = cv2.phaseCorrelate(before, after, window)
         return float(shift_x), float(shift_y), float(response)
 
-    @staticmethod
-    def scene_motion_score(before: bytes, after: bytes) -> float:
-        """Return proportion of sampled colour channels changed by a scroll."""
-        if not before or len(before) != len(after):
-            return 1.0
-        changed = sum(abs(left - right) >= 2 for left, right in zip(before, after))
-        return changed / len(before)
-
     def press(self, keycode: int, duration: float = 0.15) -> None:
         if not self.execute:
             print(f"[dry-run] key {keycode}")
@@ -313,8 +313,10 @@ class MacClient:
         down = CGEventCreateKeyboardEvent(None, keycode, True)
         up = CGEventCreateKeyboardEvent(None, keycode, False)
         CGEventPost(kCGHIDEventTap, down)
-        time.sleep(duration)
-        CGEventPost(kCGHIDEventTap, up)
+        try:
+            time.sleep(duration)
+        finally:
+            CGEventPost(kCGHIDEventTap, up)
 
     def hold(self, keycodes: Iterable[int], duration: float) -> None:
         keys = list(keycodes)
@@ -322,11 +324,15 @@ class MacClient:
             print(f"[dry-run] hold {keys}")
             return
         self._focus()
-        for key in keys:
-            CGEventPost(kCGHIDEventTap, CGEventCreateKeyboardEvent(None, key, True))
-        time.sleep(duration)
-        for key in reversed(keys):
-            CGEventPost(kCGHIDEventTap, CGEventCreateKeyboardEvent(None, key, False))
+        pressed: list[int] = []
+        try:
+            for key in keys:
+                CGEventPost(kCGHIDEventTap, CGEventCreateKeyboardEvent(None, key, True))
+                pressed.append(key)
+            time.sleep(duration)
+        finally:
+            for key in reversed(pressed):
+                CGEventPost(kCGHIDEventTap, CGEventCreateKeyboardEvent(None, key, False))
 
     def _focus(self) -> None:
         window = self.find_window()

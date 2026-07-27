@@ -168,7 +168,7 @@ class AutoDNF:
     def town_fatigue(boxes: list[TextBox]) -> int | None:
         readings: list[tuple[TextBox, int]] = []
         for box in boxes:
-            match = re.fullmatch(r"(\d{1,3})/100", box.normalized)
+            match = re.fullmatch(r"([0-9]{1,3})/100", box.normalized)
             if (
                 match
                 and 0 <= int(match.group(1)) <= 100
@@ -198,37 +198,23 @@ class AutoDNF:
             timeout=15,
         )
 
-        seen_pages: set[tuple[str, ...]] = set()
-        for page_number in range(1, 7):
+        board_deadline = time.monotonic() + 8
+        stable_empty_frames = 0
+        while True:
             fatigue_rows = [
                 (box, int(match.group(1)))
                 for box in boxes
-                if (match := re.fullmatch(r"(\d{1,3})/100", box.normalized))
+                if (match := re.fullmatch(r"([0-9]{1,3})/100", box.normalized))
                 and 0 <= int(match.group(1)) <= 100
                 and 0.18 < box.center[1] < 0.78
             ]
-            page_signature = tuple(
-                sorted(
-                    box.normalized
-                    for box in boxes
-                    if 0.18 < box.center[1] < 0.82 and box.normalized
-                )
-            )
-            if page_signature in seen_pages:
-                print("Character-selection pages have wrapped; no available character remains")
-                return False
-            seen_pages.add(page_signature)
-
             available = sorted(
                 ((fatigue, box.center[1]) for box, fatigue in fatigue_rows if fatigue >= 10),
                 key=lambda item: (-item[0], -item[1]),
             )
             if available:
                 fatigue, row_y = available[0]
-                print(
-                    f"Selecting character with {fatigue}/100 fatigue "
-                    f"from board page {page_number}"
-                )
+                print(f"Selecting character with {fatigue}/100 fatigue from the first board page")
                 self.client.click(window, (0.45, row_y), f"available character ({fatigue}/100)")
                 time.sleep(0.8)
                 window = self.client.find_window()
@@ -242,31 +228,25 @@ class AutoDNF:
                 print("New character login complete")
                 return True
 
-            # The board can contain multiple pages. The verified board layout
-            # has a right-page arrow midway down its right edge. Stop if the
-            # click does not produce a new OCR page instead of looping blindly.
-            print(f"No fatigue >= 10 on character board page {page_number}; checking next page")
-            previous_signature = page_signature
-            self.client.click(window, (0.955, 0.47), "next character-board page")
-            page_deadline = time.monotonic() + 4
-            while time.monotonic() < page_deadline:
-                time.sleep(0.5)
-                window = self.client.find_window()
-                boxes = self.client.ocr(window)
-                new_signature = tuple(
-                    sorted(
-                        box.normalized
-                        for box in boxes
-                        if 0.18 < box.center[1] < 0.82 and box.normalized
-                    )
-                )
-                if new_signature != previous_signature:
-                    break
+            # The title/button can render before the rows. Require two
+            # complete-looking OCR frames before concluding the first page has
+            # no eligible role. Never click the board's right-page arrow.
+            if len(fatigue_rows) >= 3:
+                stable_empty_frames += 1
             else:
-                print("Character board did not advance; no available character remains")
+                stable_empty_frames = 0
+            if stable_empty_frames >= 2:
+                print("First character-board page has no role with fatigue >= 10")
                 return False
-        print("Character board safety limit reached")
-        return False
+            if time.monotonic() >= board_deadline:
+                print(
+                    "Timed out reading an eligible role on the first character-board page "
+                    f"(last frame contained {len(fatigue_rows)} fatigue value(s))"
+                )
+                return False
+            time.sleep(0.5)
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
 
     def continue_from_realm_selection(self, battle: bool = False) -> None:
         self.click_then_wait(
@@ -335,7 +315,7 @@ class AutoDNF:
             fatigue_readings = [
                 (box, int(match.group(1)))
                 for box in boxes
-                if (match := re.fullmatch(r"(\d{1,3})/100", box.normalized))
+                if (match := re.fullmatch(r"([0-9]{1,3})/100", box.normalized))
                 and 0 <= int(match.group(1)) <= 100
             ]
             if fatigue_readings:
@@ -348,7 +328,13 @@ class AutoDNF:
                 )[1]
             slots = sorted(find("可配置角色", boxes), key=lambda box: box.center[0])
             party_fatigue = len(find("100/100", boxes))
-            party_power = len([box for box in boxes if re.fullmatch(r"\d{1,3}(?:[,，]\d{3})+", box.text or "")])
+            party_power = len(
+                [
+                    box
+                    for box in boxes
+                    if re.fullmatch(r"[0-9]{1,3}(?:[,，][0-9]{3})+", box.text or "")
+                ]
+            )
             if party_fatigue >= 3 or party_power >= 3:
                 print("Detected an existing three-character formation")
                 return
@@ -603,45 +589,61 @@ class AutoDNF:
             self.click_right_button("确认", window, boxes, "entry material confirmation")
 
     def collect_visible_rewards(self) -> None:
-        """Follow off-screen-loot arrows, center the pile, then sweep it."""
-        self.follow_reward_arrows()
+        """Find a pile with the model/OCR, loosely center it, then sweep."""
         window = self.client.find_window()
         center = self.wait_for_reward_pile(timeout=2.4)
         if center is None:
             self.explore_for_rewards()
-            self.follow_reward_arrows()
             window = self.client.find_window()
             center = self.wait_for_reward_pile(timeout=2.4)
         if center is not None:
-            # The terms are item-specific, so a text cluster near an edge is
-            # a reliable cue to walk toward the pile.
-            for _ in range(3):
-                if 0.43 <= center[0] <= 0.57:
+            # The spiral covers some surrounding area, but the pile still
+            # needs to be reasonably central. Allow up to four useful moves
+            # while never chasing it back across the screen after an overshoot.
+            previous_direction: int | None = None
+            previous_distance = abs(center[0] - 0.5)
+            for _ in range(4):
+                if 0.38 <= center[0] <= 0.62:
                     break
                 direction = 124 if center[0] > 0.57 else 123  # right / left arrow
-                print(f"Reward pile at x={center[0]:.2f}; repositioning toward screen centre")
-                self.client.hold([direction], 0.45)
-                time.sleep(0.5)
-                center = self.wait_for_reward_pile(timeout=1.2)
-                if center is None:
+                if previous_direction is not None and direction != previous_direction:
+                    print("Pile crossed the centre after repositioning; stopping correction")
                     break
+                print(f"Reward pile at x={center[0]:.2f}; repositioning toward screen centre")
+                self.client.hold([direction], 0.35)
+                time.sleep(0.5)
+                updated = self.wait_for_reward_pile(timeout=1.2)
+                if updated is None:
+                    break
+                updated_distance = abs(updated[0] - 0.5)
+                center = updated
+                if updated_distance >= previous_distance - 0.015:
+                    print("Pile position did not improve; stopping correction")
+                    break
+                previous_direction = direction
+                previous_distance = updated_distance
         if center is None:
-            # OCR is intentionally conservative: do not move blindly if no
-            # reward-specific label can be identified.
+            # Do not move blindly after the full model/OCR map search.
             center = (0.58, 0.43)
-            print("No reward-specific label detected; sweeping central world area without moving")
+            print("No model/OCR pile detected; sweeping central world area without moving")
         for radius in (0.12, 0.18):
             self.client.spiral_drag(window, center, radius=radius, turns=3.5)
             time.sleep(0.6)
 
     def wait_for_reward_pile(self, timeout: float) -> tuple[float, float] | None:
-        """Allow model/OCR pile evidence to settle after a transition."""
+        """Require a second pile observation after a short drop-settling delay."""
         deadline = time.monotonic() + timeout
         while True:
             window = self.client.find_window()
             center = self.detect_reward_pile(window)
             if center is not None:
-                return center
+                print("Reward pile detected; waiting 200 ms for drops to settle")
+                time.sleep(0.2)
+                window = self.client.find_window()
+                confirmed = self.detect_reward_pile(window)
+                if confirmed is not None:
+                    return confirmed
+                print("Pile was not visible in the confirmation frame; continuing detection")
             if time.monotonic() >= deadline:
                 return None
             time.sleep(0.4)
@@ -658,21 +660,6 @@ class AutoDNF:
             return center
         return self.reward_pile_center(self.client.ocr(window))
 
-    def follow_reward_arrows(self) -> None:
-        """Walk toward the cyan edge arrow until the remaining loot is visible."""
-        for step in range(1, 9):
-            window = self.client.find_window()
-            direction = self.client.reward_arrow_direction(window)
-            if direction is None:
-                if step > 1:
-                    print("Reward guidance arrow disappeared")
-                return
-            keycode = 124 if direction == "right" else 123
-            print(f"Following {direction} reward arrow ({step}/8)")
-            self.client.hold([keycode], 0.40)
-            time.sleep(0.35)
-        print("Reward guidance arrow still visible after 8 steps; sweeping current area")
-
     def explore_for_rewards(self) -> None:
         """Search right first, then left when the right camera edge is reached."""
         print("No reward cue visible; exploring right, then left if needed")
@@ -682,9 +669,6 @@ class AutoDNF:
                 window = self.client.find_window()
                 if self.detect_reward_pile(window) is not None:
                     print(f"Found reward pile while exploring {direction}")
-                    return
-                if self.client.reward_arrow_direction(window) is not None:
-                    print(f"Found a reward arrow while exploring {direction}")
                     return
                 before = self.client.world_phase_frame(window)
                 print(f"Exploring {direction} ({step}/12)")
@@ -759,7 +743,11 @@ class AutoDNF:
             except TimeoutError:
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
-                fatigue = [int(match.group(1)) for box in boxes if (match := re.fullmatch(r"(\d{1,3})/100", box.normalized))]
+                fatigue = [
+                    int(match.group(1))
+                    for box in boxes
+                    if (match := re.fullmatch(r"([0-9]{1,3})/100", box.normalized))
+                ]
                 if fatigue and min(fatigue) < 10:
                     self.click_right_button("领奖结算", window, boxes, "settlement exit")
                     return
@@ -792,8 +780,9 @@ class AutoDNF:
 
         fatigue: list[tuple[TextBox, int]] = []
         for box in boxes:
-            if box.normalized.isdigit() and 0 <= int(box.normalized) <= 100:
-                fatigue.append((box, int(box.normalized)))
+            match = re.fullmatch(r"[0-9]{1,3}", box.normalized)
+            if match and 0 <= int(match.group(0)) <= 100:
+                fatigue.append((box, int(match.group(0))))
         selected = find("选择完成", boxes)
         fatigue_blocked = find("疲劳值不足", boxes)
 

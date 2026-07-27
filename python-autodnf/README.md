@@ -14,6 +14,10 @@ pip install -r requirements.txt
 The terminal needs **Screen Recording** and **Accessibility** permissions in
 macOS Privacy & Security settings.
 
+Press **Control+T** at any time to stop a running workflow, even while the game
+window has focus. The global shortcut uses the same Accessibility permission
+required for game input.
+
 ## Commands
 
 ```sh
@@ -38,13 +42,19 @@ state.
 
 ## Object-detector data
 
-`capture` saves read-only game frames for a custom loot/arrow detector. See
+`capture` saves read-only game frames for the custom loot-pile detector. See
 [dataset/README.md](dataset/README.md) for collection and annotation steps.
 
 During reward collection, the workflow lazily loads
 `runs/detector/loot_piles/weights/best.pt` and uses the highest-confidence
 detection in the playable world area to center the pile. Bottom HUD detections
 are ignored, and reward-specific OCR remains available as a fallback.
+Every initial pile observation is confirmed on a fresh frame after 200 ms so
+airborne drops can settle before repositioning and collection.
 Full-map exploration uses phase correlation on the gameplay background to
 detect horizontal camera translation and stop reliably at map edges despite
 local character animation.
+Reward guidance arrows are intentionally ignored because combat effects can
+imitate their cyan colour. Pile repositioning uses a `0.38–0.62` centre band and
+stops after at most four improving moves, or immediately on an overshoot or
+non-improving move, to avoid left/right oscillation.
