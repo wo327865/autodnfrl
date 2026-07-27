@@ -183,6 +183,16 @@ class MacClient:
             capture_output=True,
         )
 
+    def capture_png_bytes(self, window: Window) -> bytes:
+        """Capture a window as PNG bytes without retaining a local screenshot."""
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+            path = Path(handle.name)
+        try:
+            self.capture_png(window, path)
+            return path.read_bytes()
+        finally:
+            path.unlink(missing_ok=True)
+
     def ocr(self, window: Window) -> list[TextBox]:
         request = VNRecognizeTextRequest.alloc().init()
         request.setRecognitionLevel_(VNRequestTextRecognitionLevelAccurate)

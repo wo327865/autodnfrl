@@ -40,6 +40,45 @@ another character with at least 10 fatigue, and repeats until none remain.
 The battle routine is intentionally conservative and stops on an unrecognized
 state.
 
+## AI vision fallback (optional)
+
+The deterministic OCR state machine remains the primary controller. When a
+known **non-dungeon** state times out, an optional Gemini fallback can inspect
+one compact screenshot and recommend `wait`, a harmless text-button click, a
+popup close, or human help. It is never called after dungeon evidence is
+detected.
+
+Gemini 2.5 Flash-Lite is the default because it accepts image input and has a
+free API tier. Create a key in Google AI Studio, keep it out of the repository,
+and enable advice:
+
+```sh
+export GEMINI_API_KEY="your-key"
+python -m autodnf_py run --battle --execute --debug --vision-fallback
+```
+
+Advice mode automatically performs only `wait`; suggested clicks are printed
+and the workflow stops. To permit safe clicks that also pass local allow-list,
+OCR uniqueness, coordinate, and confidence checks:
+
+```sh
+python -m autodnf_py run --battle --execute --debug \
+  --vision-fallback --vision-auto-act
+```
+
+The fallback sends at most three screenshots per process, with at least 20
+seconds between calls. These can be tightened without code changes:
+
+```sh
+export AUTODNF_VISION_MAX_CALLS=2
+export AUTODNF_VISION_MIN_INTERVAL=30
+export AUTODNF_VISION_MODEL=gemini-2.5-flash-lite
+```
+
+Free-tier screenshots may be used by Google to improve its products. Do not
+enable the cloud fallback if the game window contains information you do not
+want to send to an external API.
+
 ## Object-detector data
 
 `capture` saves read-only game frames for the custom loot-pile detector. See

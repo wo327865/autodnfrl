@@ -5,6 +5,12 @@ import time
 
 from .detector import LootPileDetector
 from .macos import MacClient, TextBox, Window
+from .vision_fallback import (
+    SAFE_CLICK_TEXTS,
+    GeminiVisionFallback,
+    VisionAdvisor,
+    VisionFallbackError,
+)
 
 
 def find(text: str, boxes: list[TextBox]) -> list[TextBox]:
@@ -18,10 +24,19 @@ def exact(text: str, boxes: list[TextBox]) -> list[TextBox]:
 
 
 class AutoDNF:
-    def __init__(self, client: MacClient, debug: bool = False) -> None:
+    def __init__(
+        self,
+        client: MacClient,
+        debug: bool = False,
+        vision_fallback: VisionAdvisor | None = None,
+        vision_auto_act: bool = False,
+    ) -> None:
         self.client = client
         self.debug = debug
         self.loot_detector = LootPileDetector()
+        self.vision_fallback = vision_fallback
+        self.vision_auto_act = vision_auto_act
+        self.in_dungeon = False
 
     def wait_for(self, texts: list[str], state: str, timeout: float = 18) -> tuple[Window, list[TextBox]]:
         _, window, boxes = self.wait_for_any({state: texts}, timeout)
@@ -41,9 +56,26 @@ class AutoDNF:
         """
         deadline = time.monotonic() + timeout
         delay = 0.4
-        while time.monotonic() < deadline:
+        vision_attempted = False
+        last_window: Window | None = None
+        last_boxes: list[TextBox] = []
+        while True:
+            if time.monotonic() >= deadline:
+                if (
+                    not vision_attempted
+                    and self.vision_fallback is not None
+                    and not self.in_dungeon
+                    and last_window is not None
+                ):
+                    vision_attempted = True
+                    if self.try_vision_recovery(states, last_window, last_boxes):
+                        deadline = time.monotonic() + min(timeout, 12)
+                        delay = 0.4
+                        continue
+                break
             window = self.client.find_window()
             boxes = self.client.ocr(window)
+            last_window, last_boxes = window, boxes
             for state, texts in states.items():
                 if all(find(text, boxes) for text in texts):
                     print(f"Detected {state}")
@@ -52,6 +84,98 @@ class AutoDNF:
             delay = min(1.2, delay * 1.25)
         names = ", ".join(states)
         raise TimeoutError(f"Timed out waiting for one of: {names}")
+
+    def try_vision_recovery(
+        self,
+        expected_states: dict[str, list[str]],
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Ask the model once, then locally gate any suggested action."""
+        assert self.vision_fallback is not None
+        try:
+            screenshot = self.client.capture_png_bytes(window)
+            advice = self.vision_fallback.analyze(
+                screenshot,
+                expected_states,
+                [box.text for box in boxes],
+            )
+        except (VisionFallbackError, OSError, ValueError) as error:
+            print(f"AI vision fallback unavailable: {error}")
+            return False
+
+        print(
+            f"AI vision fallback: {advice.obstruction}; "
+            f"suggested {advice.action} (confidence {advice.confidence:.2f})"
+        )
+        print(f"AI reason: {advice.reason}")
+
+        if advice.action == "wait":
+            print("AI fallback is waiting 3 seconds before rechecking known states")
+            time.sleep(3)
+            return True
+        if advice.action == "ask_human":
+            print("AI fallback requested human help; no action was taken")
+            return False
+        if not self.vision_auto_act:
+            print(
+                "AI fallback advice only; rerun with --vision-auto-act to allow "
+                "locally validated safe clicks"
+            )
+            return False
+        if not self.client.execute:
+            print("AI fallback did not click because --execute is not enabled")
+            return False
+
+        # The API response can take seconds. Resolve all actions against a
+        # fresh frame so stale OCR boxes or coordinates cannot be clicked.
+        window = self.client.find_window()
+        boxes = self.client.ocr(window)
+        if advice.action == "click_text":
+            if advice.target_text not in SAFE_CLICK_TEXTS:
+                print(f"Rejected unsafe AI button text {advice.target_text!r}")
+                return False
+            choices = exact(advice.target_text, boxes)
+            if len(choices) != 1:
+                print(
+                    f"Rejected AI click: expected one exact {advice.target_text!r}, "
+                    f"found {len(choices)}"
+                )
+                return False
+            self.client.click(
+                window,
+                choices[0].center,
+                f"AI-safe {advice.target_text}",
+            )
+            time.sleep(1)
+            return True
+
+        # A visual X often has no OCR label. Require high confidence and a
+        # top-right popup position; this rejects arbitrary model coordinates.
+        if (
+            advice.action == "close_popup"
+            and advice.confidence >= 0.90
+            and 0.55 <= advice.point_x <= 0.96
+            and 0.04 <= advice.point_y <= 0.42
+        ):
+            current_screenshot = self.client.capture_png_bytes(window)
+            if not GeminiVisionFallback.close_region_is_stable(
+                screenshot,
+                current_screenshot,
+                advice.point_x,
+                advice.point_y,
+            ):
+                print("Rejected AI popup close because the visual target changed")
+                return False
+            self.client.click(
+                window,
+                (advice.point_x, 1.0 - advice.point_y),
+                "AI-safe popup close",
+            )
+            time.sleep(1)
+            return True
+        print("Rejected AI popup-close point because it failed local safety checks")
+        return False
 
     def click_text(self, text: str, state: str, require: list[str] | None = None) -> None:
         window, boxes = self.wait_for([text, *(require or [])], state)
@@ -503,6 +627,13 @@ class AutoDNF:
         while time.monotonic() < deadline:
             window = self.client.find_window()
             boxes = self.client.ocr(window)
+            if (
+                find("秘境：", boxes)
+                or find("再次挑战", boxes)
+                or find("领奖结算", boxes)
+                or len(find("/100", boxes)) >= 2
+            ):
+                self.in_dungeon = True
             # Confirmation dialog after the standalone final 结算 button.
             # Check this before the dimmed background's exact 结算 text.
             if find("完成结算", boxes) and exact("确认", boxes):
@@ -546,6 +677,7 @@ class AutoDNF:
                     "town after dungeon exit",
                     timeout=90,
                 )
+                self.in_dungeon = False
                 print("Returned to town. Battle loop complete.")
                 return
             # Check town only after every result-screen branch. A boss-room
@@ -563,6 +695,7 @@ class AutoDNF:
             if town_control and not dungeon_evidence:
                 town_frames += 1
                 if town_frames >= 2:
+                    self.in_dungeon = False
                     print("Town screen detected. Battle loop complete.")
                     return
                 time.sleep(0.6)

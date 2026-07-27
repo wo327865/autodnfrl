@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .macos import GlobalStopShortcut, MacClient
+from .vision_fallback import GeminiVisionFallback, VisionFallbackError
 from .workflow import AutoDNF
 
 
@@ -16,15 +17,38 @@ def main() -> None:
     parser.add_argument("--execute", action="store_true", help="allow clicks and key presses")
     parser.add_argument("--battle", action="store_true", help="continue into the dungeon after party formation")
     parser.add_argument("--debug", action="store_true", help="print OCR-derived party-card detection details")
+    parser.add_argument(
+        "--vision-fallback",
+        action="store_true",
+        help="ask Gemini for advice when a known non-dungeon state times out",
+    )
+    parser.add_argument(
+        "--vision-auto-act",
+        action="store_true",
+        help="allow locally validated safe AI actions (requires --vision-fallback and --execute)",
+    )
     parser.add_argument("--window", default="地下城与勇士")
     parser.add_argument("--count", type=int, default=1, help="frames to save with the capture command")
     parser.add_argument("--interval", type=float, default=1.0, help="seconds between captured frames")
     parser.add_argument("--tag", default="frame", help="scenario tag used in captured frame names")
     parser.add_argument("--output", default="dataset/images", help="directory for captured detector-training images")
     args = parser.parse_args()
+    if args.vision_auto_act and not args.vision_fallback:
+        parser.error("--vision-auto-act requires --vision-fallback")
 
     client = MacClient(args.window, args.execute)
-    flow = AutoDNF(client, debug=args.debug)
+    try:
+        vision_fallback = (
+            GeminiVisionFallback.from_env() if args.vision_fallback else None
+        )
+    except VisionFallbackError as error:
+        parser.error(str(error))
+    flow = AutoDNF(
+        client,
+        debug=args.debug,
+        vision_fallback=vision_fallback,
+        vision_auto_act=args.vision_auto_act,
+    )
     shortcut = GlobalStopShortcut()
     shortcut.start()
     print("Press Control+T at any time to stop AutoDNF.")
