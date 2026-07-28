@@ -13,7 +13,10 @@ from .workflow import AutoDNF
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="DNF PlayCover automation")
-    parser.add_argument("command", choices=["scan", "capture", "run", "realm", "party", "battle"])
+    parser.add_argument(
+        "command",
+        choices=["scan", "capture", "run", "realm", "party", "battle", "maintenance"],
+    )
     parser.add_argument("--execute", action="store_true", help="allow clicks and key presses")
     parser.add_argument("--battle", action="store_true", help="continue into the dungeon after party formation")
     parser.add_argument("--debug", action="store_true", help="print OCR-derived party-card detection details")
@@ -90,6 +93,8 @@ def main() -> None:
             flow.configure_party()
             if args.battle:
                 flow.run_battle(start_by_entering=True)
+        elif args.command == "maintenance":
+            flow.run_mail_maintenance_all()
         else:
             flow.run_battle(start_by_entering=False)
     except KeyboardInterrupt:

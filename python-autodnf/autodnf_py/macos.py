@@ -201,19 +201,21 @@ class MacClient:
         self,
         window: Window,
         region: tuple[float, float, float, float],
+        language_correction: bool = True,
     ) -> list[TextBox]:
         """OCR one Vision-normalized region instead of the whole window."""
-        return self._ocr(window, region)
+        return self._ocr(window, region, language_correction=language_correction)
 
     def _ocr(
         self,
         window: Window,
         region: tuple[float, float, float, float] | None = None,
+        language_correction: bool = True,
     ) -> list[TextBox]:
         request = VNRecognizeTextRequest.alloc().init()
         request.setRecognitionLevel_(VNRequestTextRecognitionLevelAccurate)
         request.setRecognitionLanguages_(["zh-Hans", "en-US"])
-        request.setUsesLanguageCorrection_(True)
+        request.setUsesLanguageCorrection_(language_correction)
         if region is not None:
             request.setRegionOfInterest_(CGRectMake(*region))
         handler = VNImageRequestHandler.alloc().initWithCGImage_options_(self.screenshot(window), {})
@@ -440,6 +442,37 @@ class MacClient:
         finally:
             for key in reversed(pressed):
                 CGEventPost(kCGHIDEventTap, CGEventCreateKeyboardEvent(None, key, False))
+
+    def hold_and_press_sequence(
+        self,
+        held_keycode: int,
+        keycodes: Iterable[int],
+        key_duration: float = 0.09,
+        interval: float = 0.035,
+        movement_tail: float = 0.0,
+    ) -> None:
+        """Keep one movement key held while issuing a paced skill sequence."""
+        keys = list(keycodes)
+        if not self.execute:
+            print(f"[dry-run] hold {held_keycode}; press sequence {keys}")
+            return
+        self._focus()
+        movement_down = False
+        try:
+            CGEventPost(kCGHIDEventTap, CGEventCreateKeyboardEvent(None, held_keycode, True))
+            movement_down = True
+            for keycode in keys:
+                CGEventPost(kCGHIDEventTap, CGEventCreateKeyboardEvent(None, keycode, True))
+                try:
+                    time.sleep(key_duration)
+                finally:
+                    CGEventPost(kCGHIDEventTap, CGEventCreateKeyboardEvent(None, keycode, False))
+                time.sleep(interval)
+            if movement_tail:
+                time.sleep(movement_tail)
+        finally:
+            if movement_down:
+                CGEventPost(kCGHIDEventTap, CGEventCreateKeyboardEvent(None, held_keycode, False))
 
     def _focus(self) -> None:
         window = self.find_window()

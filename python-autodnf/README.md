@@ -72,7 +72,9 @@ seconds between calls. These can be tightened without code changes:
 ```sh
 export AUTODNF_VISION_MAX_CALLS=2
 export AUTODNF_VISION_MIN_INTERVAL=30
-export AUTODNF_VISION_MODEL=gemini-2.5-flash-lite
+export AUTODNF_VISION_MODEL=gemini-3.6-flash
+# Optional: Gemini 3.6 can take longer than a lightweight model on screenshots.
+export AUTODNF_VISION_TIMEOUT=45
 ```
 
 Free-tier screenshots may be used by Google to improve its products. Do not
