@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .macos import GlobalStopShortcut, MacClient
+from .template_matcher import FixedTemplateMatcher
 from .vision_fallback import GeminiVisionFallback, VisionFallbackError
 from .workflow import AutoDNF
 
@@ -35,6 +36,12 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=1.0, help="seconds between captured frames")
     parser.add_argument("--tag", default="frame", help="scenario tag used in captured frame names")
     parser.add_argument("--output", default="dataset/images", help="directory for captured detector-training images")
+    parser.add_argument(
+        "--template-manifest",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "templates/dismantle/manifest.json",
+        help="fixed-position UI template manifest",
+    )
     args = parser.parse_args()
     if args.vision_auto_act and not args.vision_fallback:
         parser.error("--vision-auto-act requires --vision-fallback")
@@ -46,11 +53,18 @@ def main() -> None:
         )
     except VisionFallbackError as error:
         parser.error(str(error))
+    template_matcher = None
+    if args.template_manifest.is_file():
+        try:
+            template_matcher = FixedTemplateMatcher.load(args.template_manifest)
+        except ValueError as error:
+            parser.error(str(error))
     flow = AutoDNF(
         client,
         debug=args.debug,
         vision_fallback=vision_fallback,
         vision_auto_act=args.vision_auto_act,
+        template_matcher=template_matcher,
     )
     shortcut = GlobalStopShortcut()
     shortcut.start()

@@ -3,3 +3,4 @@ pyobjc-framework-Quartz>=11.0
 pyobjc-framework-Vision>=11.0
 ultralytics>=8.4
 Pillow>=10.0
+opencv-python>=4.10

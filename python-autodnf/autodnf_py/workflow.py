@@ -5,6 +5,7 @@ import time
 
 from .detector import LootPileDetector
 from .macos import MacClient, TextBox, Window
+from .template_matcher import FixedTemplateMatcher, TemplateMatch
 from .vision_fallback import (
     SAFE_CLICK_TEXTS,
     GeminiVisionFallback,
@@ -39,6 +40,18 @@ class AutoDNF:
     # window's outer top-left edge.
     PAGE_BACK_POINT = (0.04, 0.94)
     STORY_SKIP_FALLBACK_POINT = (0.94, 0.93)
+    DISMANTLE_TEMPLATE_NAMES = (
+        "dismantle_ready",
+        "dismantle_empty",
+        "dismantle_confirm",
+        "dismantle_close",
+        "inventory_ready",
+    )
+    DISMANTLE_CLICKABLE_TEMPLATES = (
+        "dismantle_ready",
+        "dismantle_confirm",
+        "dismantle_close",
+    )
     # macOS hardware keycodes, in the requested in-game attack order:
     # A, S, F, G, Q, W, E, R, X, V, T, B.
     SOLO_SKILL_KEYS = (0, 1, 3, 5, 12, 13, 14, 15, 7, 9, 17, 11)
@@ -49,12 +62,14 @@ class AutoDNF:
         debug: bool = False,
         vision_fallback: VisionAdvisor | None = None,
         vision_auto_act: bool = False,
+        template_matcher: FixedTemplateMatcher | None = None,
     ) -> None:
         self.client = client
         self.debug = debug
         self.loot_detector = LootPileDetector()
         self.vision_fallback = vision_fallback
         self.vision_auto_act = vision_auto_act
+        self.template_matcher = template_matcher
         self.in_dungeon = False
         self.solo_battle = False
         self.solo_skill_index = 0
@@ -441,12 +456,63 @@ class AutoDNF:
 
     def dismantle_all_available_equipment(self) -> None:
         """Repeatedly dismantle all selectable equipment, then return to town."""
+        use_templates = (
+            self.template_matcher is not None
+            and self.template_matcher.has_all(
+                self.DISMANTLE_TEMPLATE_NAMES
+            )
+            and not self.template_matcher.non_clickable(
+                self.DISMANTLE_CLICKABLE_TEMPLATES
+            )
+        )
+        if use_templates:
+            # The town control remains a stable OCR anchor. From the moment the
+            # inventory click is sent until the panel is closed, every state
+            # decision below is made by fixed-position image templates.
+            window, boxes = self.wait_for(
+                ["委托", "背包"],
+                "town before inventory",
+                timeout=15,
+            )
+            self.click_from_boxes("背包", window, boxes, "open inventory")
+            self.wait_for_template_any(
+                ("dismantle_empty", "dismantle_ready"),
+                "inventory dismantle panel",
+                timeout=15,
+                stable_frames=2,
+            )
+            print("Using fixed-position image templates for dismantle workflow")
+            self.dismantle_all_available_equipment_by_template()
+            return
+
         self.click_then_wait(
             "背包",
             "town before inventory",
             ["委托", "背包"],
             {"inventory": ["背包", "道具"]},
         )
+        if self.template_matcher is not None:
+            missing = ", ".join(
+                self.template_matcher.missing(self.DISMANTLE_TEMPLATE_NAMES)
+            )
+            non_clickable = ", ".join(
+                self.template_matcher.non_clickable(
+                    self.DISMANTLE_CLICKABLE_TEMPLATES
+                )
+            )
+            issues = []
+            if missing:
+                issues.append(f"missing: {missing}")
+            if non_clickable:
+                issues.append(f"missing click points: {non_clickable}")
+            print(
+                f"Dismantle templates are incomplete ({'; '.join(issues)}); "
+                "using OCR fallback"
+            )
+        self.dismantle_all_available_equipment_by_ocr()
+
+    def dismantle_all_available_equipment_by_ocr(self) -> None:
+        """Legacy dismantling path retained until all reference crops exist."""
         for batch in range(1, 21):
             window, boxes = self.wait_for(["背包", "分解"], "inventory", timeout=15)
             # The empty-state text is the authoritative stop condition. The
@@ -483,6 +549,120 @@ class AutoDNF:
         self.client.click(window, (0.94, 0.895), "close empty dismantle panel")
         self.wait_for(["背包", "道具"], "inventory after dismantle close", timeout=12)
         self.return_to_town_from_page("背包", "inventory")
+
+    def dismantle_all_available_equipment_by_template(self) -> None:
+        """Dismantle using only fixed-position crops after the inventory opens."""
+        for batch in range(1, 21):
+            window, match = self.wait_for_template_any(
+                ("dismantle_empty", "dismantle_ready"),
+                "dismantle ready or empty",
+                timeout=15,
+                stable_frames=2,
+            )
+            if match.name == "dismantle_empty":
+                print("Template detected no selectable equipment")
+                break
+            self.click_template(window, match, f"dismantle batch {batch}")
+
+            window, prompt = self.wait_for_template_any(
+                ("dismantle_confirm",),
+                "dismantle confirmation",
+                timeout=12,
+            )
+            # The first confirmation can be followed by a high-value warning
+            # and a completion acknowledgement. All variants share the same
+            # logical name but carry their own crop and click offset.
+            for confirmation in range(1, 5):
+                label = (
+                    "confirm dismantle"
+                    if confirmation == 1
+                    else f"confirm dismantle follow-up {confirmation - 1}"
+                )
+                self.click_template(window, prompt, label)
+                time.sleep(0.7)
+                window, next_state = self.wait_for_template_any(
+                    (
+                        "dismantle_confirm",
+                        "dismantle_empty",
+                        "dismantle_ready",
+                    ),
+                    "dismantle prompt transition",
+                    timeout=10,
+                )
+                if next_state.name != "dismantle_confirm":
+                    break
+                prompt = next_state
+            else:
+                raise RuntimeError(
+                    "Dismantle confirmation remained after four template clicks"
+                )
+        else:
+            raise RuntimeError("Dismantle safety limit reached before the empty equipment state")
+
+        window, close = self.wait_for_template_any(
+            ("dismantle_close",),
+            "empty dismantle panel close",
+            timeout=10,
+            stable_frames=2,
+        )
+        self.click_template(window, close, "close empty dismantle panel")
+        window, _ = self.wait_for_template_any(
+            ("inventory_ready",),
+            "inventory after dismantle close",
+            timeout=12,
+            stable_frames=2,
+        )
+        self.client.click(window, self.PAGE_BACK_POINT, "back from inventory")
+        self.wait_for(["委托", "选角"], "town after inventory exit", timeout=25)
+
+    def wait_for_template_any(
+        self,
+        names: tuple[str, ...],
+        state: str,
+        timeout: float,
+        stable_frames: int = 1,
+    ) -> tuple[Window, TemplateMatch]:
+        """Wait for the first matching template in priority order."""
+        if self.template_matcher is None:
+            raise RuntimeError("Fixed template matcher is not configured")
+        deadline = time.monotonic() + timeout
+        previous_name: str | None = None
+        consecutive = 0
+        while time.monotonic() < deadline:
+            window = self.client.find_window()
+            screenshot = self.client.capture_png_bytes(window)
+            match: TemplateMatch | None = None
+            for name in names:
+                match = self.template_matcher.match(screenshot, name)
+                if match is not None:
+                    break
+            if match is not None:
+                if match.name == previous_name:
+                    consecutive += 1
+                else:
+                    previous_name = match.name
+                    consecutive = 1
+                if consecutive >= stable_frames:
+                    print(f"Template detected {state}: {match.name} ({match.score:.3f})")
+                    return window, match
+            else:
+                previous_name = None
+                consecutive = 0
+            time.sleep(0.35)
+
+        window = self.client.find_window()
+        screenshot = self.client.capture_png_bytes(window)
+        scores = self.template_matcher.scores(screenshot, names)
+        details = ", ".join(f"{name}={scores[name]:.3f}" for name in names)
+        raise TimeoutError(f"Timed out waiting for template state {state}: {details}")
+
+    def click_template(self, window: Window, match: TemplateMatch, label: str) -> None:
+        point = match.click_point_vision
+        if point is None:
+            raise RuntimeError(
+                f"Template {match.name!r} has no click point; recapture it with --clickable"
+            )
+        self.client.click(window, point, f"{label} [{match.name} {match.score:.3f}]")
 
     def click_topmost_right_confirmation(
         self,

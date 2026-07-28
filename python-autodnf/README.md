@@ -40,6 +40,19 @@ another character with at least 10 fatigue, and repeats until none remain.
 The battle routine is intentionally conservative and stops on an unrecognized
 state.
 
+## Mail and dismantle maintenance
+
+```sh
+python -m autodnf_py maintenance --execute --debug
+```
+
+The dismantle portion prefers fixed-position cropped-image templates because
+the small stylized labels and foreground/dimmed confirmation dialogs are not
+consistently recognized by OCR. Use
+[templates/dismantle/README.md](templates/dismantle/README.md) to capture the
+five required reference states. Until the set is complete, the existing OCR
+path remains active.
+
 ## AI vision fallback (optional)
 
 The deterministic OCR state machine remains the primary controller. When a
