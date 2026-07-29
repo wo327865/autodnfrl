@@ -30,6 +30,18 @@ class AutoDNF:
     # never happens for an arbitrary unrecognised overlay.
     ACTIVITY_POPUP_TEXTS = ("活动角色福利", "前往指定活动角色")
     ACTIVITY_POPUP_CLOSE = (0.94, 0.85)
+    # This harmless informational dialog can appear shortly after switching
+    # characters. Gate the generic 确认 button behind unique guild-sign-in text
+    # so an unrelated confirmation can never be accepted automatically.
+    GUILD_SIGNIN_POPUP_TEXTS = ("每天最多", "公会签到")
+    # This post-login summary is also informational: Normal Realm experience
+    # has already been granted and its items were sent to mail. The generic
+    # 确认 button is safe only when these distinctive message fragments coexist.
+    RIFT_REWARD_MAIL_POPUP_TEXTS = ("普通秘境", "经验值", "邮件发放")
+    # Full-screen 8-day special sign-in artwork has no visible close control.
+    # It is identified by both its headline and repeated day-card labels.
+    SPECIAL_SIGNIN_POPUP_HEADLINES = ("8日特别签到", "新深渊")
+    SPECIAL_SIGNIN_DISMISS_POINT = (0.50, 0.55)
     # The town's 选角 text is small and Vision can return a box shifted onto
     # the button's decorative arrow. This is the stable centre of the actual
     # top-left button, expressed in window-normalized Vision coordinates.
@@ -41,6 +53,7 @@ class AutoDNF:
     PAGE_BACK_POINT = (0.04, 0.94)
     STORY_SKIP_FALLBACK_POINT = (0.94, 0.93)
     DISMANTLE_TEMPLATE_NAMES = (
+        "dismantle_open",
         "dismantle_ready",
         "dismantle_empty",
         "dismantle_confirm",
@@ -48,6 +61,7 @@ class AutoDNF:
         "inventory_ready",
     )
     DISMANTLE_CLICKABLE_TEMPLATES = (
+        "dismantle_open",
         "dismantle_ready",
         "dismantle_confirm",
         "dismantle_close",
@@ -73,6 +87,7 @@ class AutoDNF:
         self.in_dungeon = False
         self.solo_battle = False
         self.solo_skill_index = 0
+        self.special_signin_dismiss_attempts = 0
 
     def wait_for(self, texts: list[str], state: str, timeout: float = 18) -> tuple[Window, list[TextBox]]:
         _, window, boxes = self.wait_for_any({state: texts}, timeout)
@@ -112,6 +127,15 @@ class AutoDNF:
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             last_window, last_boxes = window, boxes
+            if self.dismiss_known_special_signin_popup(window, boxes):
+                delay = 0.4
+                continue
+            if self.dismiss_known_rift_reward_mail_popup(window, boxes):
+                delay = 0.4
+                continue
+            if self.dismiss_known_guild_signin_popup(window, boxes):
+                delay = 0.4
+                continue
             # A known town activity promotion can appear before any workflow
             # action. Dismiss it immediately rather than waiting for the
             # current state timeout and sending an unnecessary cloud request.
@@ -322,6 +346,96 @@ class AutoDNF:
         time.sleep(0.8)
         return True
 
+    def dismiss_known_guild_signin_popup(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Confirm only the uniquely identified daily guild-sign-in notice."""
+        if self.in_dungeon or not self.client.execute:
+            return False
+        if not all(find(text, boxes) for text in self.GUILD_SIGNIN_POPUP_TEXTS):
+            return False
+        choices = [
+            box
+            for box in exact("确认", boxes)
+            if 0.35 <= box.center[0] <= 0.65 and 0.20 <= box.center[1] <= 0.55
+        ]
+        if len(choices) != 1:
+            if self.debug:
+                print(
+                    "Detected guild-sign-in notice text but could not isolate "
+                    f"one safe 确认 button (found {len(choices)})"
+                )
+            return False
+        print("Detected daily guild-sign-in notice; clicking 确认")
+        self.client.click(window, choices[0].center, "confirm guild-sign-in notice")
+        time.sleep(0.8)
+        return True
+
+    def dismiss_known_rift_reward_mail_popup(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Confirm only the uniquely identified post-login rift reward notice."""
+        if self.in_dungeon or not self.client.execute:
+            return False
+        if not all(find(text, boxes) for text in self.RIFT_REWARD_MAIL_POPUP_TEXTS):
+            return False
+        choices = [
+            box
+            for box in exact("确认", boxes)
+            if 0.35 <= box.center[0] <= 0.65 and 0.20 <= box.center[1] <= 0.55
+        ]
+        if len(choices) != 1:
+            if self.debug:
+                print(
+                    "Detected Normal Realm reward-mail notice but could not "
+                    f"isolate one safe 确认 button (found {len(choices)})"
+                )
+            return False
+        print("Detected Normal Realm reward-mail notice; clicking 确认")
+        self.client.click(window, choices[0].center, "confirm rift reward-mail notice")
+        time.sleep(0.8)
+        return True
+
+    def dismiss_known_special_signin_popup(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Dismiss the uniquely identified 8-day sign-in artwork."""
+        if self.in_dungeon or not self.client.execute:
+            return False
+        headline_visible = any(
+            find(text, boxes) for text in self.SPECIAL_SIGNIN_POPUP_HEADLINES
+        )
+        visible_days = sum(
+            bool(find(f"第{day}天", boxes))
+            for day in range(1, 9)
+        )
+        # Four separate day cards uniquely identify this overlay even when
+        # Vision cannot read its glowing headline. If the headline is clear,
+        # two day cards are sufficient for the same reason.
+        if visible_days < 4 and not (headline_visible and visible_days >= 2):
+            return False
+        self.special_signin_dismiss_attempts += 1
+        if self.special_signin_dismiss_attempts == 1:
+            print("Detected 8-day special sign-in overlay; pressing Back")
+            # macOS virtual keycode 53 is Escape, which PlayCover delivers as
+            # Android Back. This closes a modal without touching town controls.
+            self.client.press(53)
+        else:
+            print("Special sign-in overlay remained; clicking its center artwork")
+            self.client.click(
+                window,
+                self.SPECIAL_SIGNIN_DISMISS_POINT,
+                "dismiss special sign-in artwork",
+            )
+        time.sleep(0.8)
+        return True
+
     def run_to_party(self, battle: bool = False) -> bool:
         self.click_then_wait(
             "委托",
@@ -398,9 +512,9 @@ class AutoDNF:
             # character after the list has been reset.
             if not self.switch_to_available_character(
                 processed=processed,
-                reset_to_top=True,
+                reset_to_top=(completed == 0),
                 minimum_fatigue=0,
-                reuse_current_if_first=True,
+                reuse_current_if_first=(completed == 0),
             ):
                 print(f"Mail and dismantle workflow complete for {completed} eligible character(s).")
                 return
@@ -433,8 +547,10 @@ class AutoDNF:
                     state, window, boxes = self.wait_for_any(
                         {
                             "backpack full": ["背包已满"],
-                            "mail claim reward": ["确认"],
-                            "mailbox after claim": ["角色邮件"],
+                            # The mailbox remains OCR-visible while the reward
+                            # dialog animates in. Require foreground-specific
+                            # text so the background cannot win this race.
+                            "mail claim reward": ["获得道具", "确认"],
                         },
                         timeout=12,
                     )
@@ -475,6 +591,13 @@ class AutoDNF:
                 timeout=15,
             )
             self.click_from_boxes("背包", window, boxes, "open inventory")
+            window, open_match = self.wait_for_template_any(
+                ("dismantle_open",),
+                "normal inventory dismantle button",
+                timeout=15,
+                stable_frames=2,
+            )
+            self.click_template(window, open_match, "open dismantle panel")
             self.wait_for_template_any(
                 ("dismantle_empty", "dismantle_ready"),
                 "inventory dismantle panel",
@@ -607,7 +730,7 @@ class AutoDNF:
         )
         self.click_template(window, close, "close empty dismantle panel")
         window, _ = self.wait_for_template_any(
-            ("inventory_ready",),
+            ("dismantle_open", "inventory_ready"),
             "inventory after dismantle close",
             timeout=12,
             stable_frames=2,
@@ -791,7 +914,27 @@ class AutoDNF:
         stable_empty_frames = 0
         unchanged_scrolls = 0
         scrolls = 0
+        # Once the current 在线 row has been positively located, every later
+        # scrolled view is necessarily below it. Keep that fact even after the
+        # marker itself moves off-screen.
+        passed_online_row = not bool(processed)
         while True:
+            # The small green 在线 badge is the traversal anchor after the
+            # first role. Re-read its fixed left strip independently because
+            # the full-window pass can omit it among the board's dense text.
+            focused_online = (
+                self.client.ocr_region(
+                    window,
+                    (0.08, 0.18, 0.14, 0.60),
+                    language_correction=True,
+                )
+                if processed
+                else []
+            )
+            marker_boxes = [
+                *boxes,
+                *[box for box in focused_online if box.normalized == "在线"],
+            ]
             visible_fatigue_rows = self.character_board_fatigue_rows(boxes)
             analysis_boxes = boxes
             if any(fatigue >= 10 for _, fatigue in visible_fatigue_rows):
@@ -832,9 +975,50 @@ class AutoDNF:
             )
             if processed is not None:
                 available = [candidate for candidate in available if candidate[3] not in processed]
+                # After the first maintenance role, traversal is monotonic:
+                # never reselect the current green 在线 row, and when it is
+                # visible choose only roles physically below it. This remains
+                # stable even when OCR changes the current role's fingerprint.
+                if processed:
+                    online_rows = [
+                        row_y
+                        for _, _, row_y in fatigue_rows
+                        if self.character_board_row_is_online(marker_boxes, row_y)
+                    ]
+                    if online_rows:
+                        online_y = max(online_rows)
+                        passed_online_row = True
+                        available = [
+                            candidate
+                            for candidate in available
+                            if candidate[2] < online_y - 0.045
+                        ]
+                        if self.debug:
+                            print(
+                                f"Continuing below online role at y={online_y:.3f}; "
+                                f"{len(available)} eligible row(s) remain on this view"
+                            )
+                    elif not passed_online_row:
+                        # Do not fall back to the OCR row fingerprint here.
+                        # A changed/missed character name could otherwise make
+                        # the current role look unprocessed. Wait for the
+                        # fixed-position 在线 anchor before selecting anything.
+                        available = []
+                        if self.debug:
+                            values = ", ".join(
+                                box.text for box in focused_online
+                            ) or "none"
+                            print(
+                                "Online-row anchor is not readable yet; "
+                                f"focused OCR: {values}"
+                            )
             if available:
                 fatigue, level, row_y, identity = available[0]
-                if reuse_current_if_first and self.character_board_row_is_online(boxes, row_y):
+                if (
+                    reuse_current_if_first
+                    and not processed
+                    and self.character_board_row_is_online(marker_boxes, row_y)
+                ):
                     print(
                         f"Current character is the first eligible role "
                         f"(level {level}); processing it without re-login"
@@ -863,6 +1047,21 @@ class AutoDNF:
                 )
                 print("New character login complete")
                 return True
+
+            if processed and not passed_online_row:
+                if time.monotonic() >= board_deadline:
+                    print(
+                        "Timed out locating the current 在线 row; no character "
+                        "was selected because board order could not be proven"
+                    )
+                    return False
+                # Scrolling before finding the marker destroys the only
+                # reliable ordering anchor. Re-render and retry in place.
+                stable_empty_frames = 0
+                time.sleep(0.5)
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                continue
 
             # The title/button can render before the rows. Require two
             # complete-looking OCR frames before treating the current view as

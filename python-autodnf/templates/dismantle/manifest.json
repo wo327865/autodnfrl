@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "coordinate_system": "normalized_top_left",
+  "templates": {
+    "dismantle_ready": [
+      {
+        "image": "images/dismantle_ready_01.png",
+        "region": [
+          0.81785714,
+          0.85169965,
+          0.86357143,
+          0.89594379
+        ],
+        "threshold": 0.9,
+        "search_margin": 0.008,
+        "click_offset": [
+          0.5625,
+          0.41666667
+        ]
+      }
+    ],
+    "dismantle_confirm": [
+      {
+        "image": "images/dismantle_confirm_01.png",
+        "region": [
+          0.55714286,
+          0.78041743,
+          0.59642857,
+          0.82097456
+        ],
+        "threshold": 0.9,
+        "search_margin": 0.008,
+        "click_offset": [
+          0.49090909,
+          0.45454545
+        ]
+      },
+      {
+        "image": "images/dismantle_confirm_02.png",
+        "region": [
+          0.55214286,
+          0.62064693,
+          0.59142857,
+          0.65505904
+        ],
+        "threshold": 0.9,
+        "search_margin": 0.008,
+        "click_offset": [
+          0.54545455,
+          0.5
+        ]
+      },
+      {
+        "image": "images/dismantle_confirm_03.png",
+        "region": [
+          0.48142857,
+          0.62924996,
+          0.51642857,
+          0.66120406
+        ],
+        "threshold": 0.9,
+        "search_margin": 0.008,
+        "click_offset": [
+          0.51020408,
+          0.46153846
+        ]
+      }
+    ],
+    "dismantle_empty": [
+      {
+        "image": "images/dismantle_empty_01.png",
+        "region": [
+          0.36357143,
+          0.4817695,
+          0.51571429,
+          0.52601364
+        ],
+        "threshold": 0.9,
+        "search_margin": 0.008
+      }
+    ],
+    "dismantle_close": [
+      {
+        "image": "images/dismantle_close_01.png",
+        "region": [
+          0.92428571,
+          0.11429736,
+          0.95357143,
+          0.1622285
+        ],
+        "threshold": 0.9,
+        "search_margin": 0.008,
+        "click_offset": [
+          0.48780488,
+          0.48717949
+        ]
+      }
+    ],
+    "inventory_ready": [
+      {
+        "image": "images/inventory_ready_01.png",
+        "region": [
+          0.32785714,
+          0.15608349,
+          0.36857143,
+          0.19786962
+        ],
+        "threshold": 0.9,
+        "search_margin": 0.008
+      }
+    ],
+    "dismantle_open": [
+      {
+        "image": "images/dismantle_open_01.png",
+        "region": [
+          0.93142857,
+          0.92421088,
+          0.98857143,
+          0.96845501
+        ],
+        "threshold": 0.9,
+        "search_margin": 0.008,
+        "click_offset": [
+          0.5,
+          0.5
+        ]
+      }
+    ]
+  }
+}

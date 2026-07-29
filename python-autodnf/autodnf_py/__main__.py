@@ -53,6 +53,18 @@ def main() -> None:
         )
     except VisionFallbackError as error:
         parser.error(str(error))
+    if args.debug:
+        if vision_fallback is None:
+            print(
+                "AI vision fallback is disabled; use --vision-fallback "
+                "(and set GEMINI_API_KEY) to enable advice"
+            )
+        else:
+            action_mode = "safe auto-actions enabled" if args.vision_auto_act else "advice only"
+            print(
+                f"AI vision fallback enabled with {vision_fallback.model} "
+                f"({action_mode})"
+            )
     template_matcher = None
     if args.template_manifest.is_file():
         try:

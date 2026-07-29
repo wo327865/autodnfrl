@@ -1,10 +1,11 @@
 # Dismantle fixed-position templates
 
-The maintenance workflow automatically uses this manifest after all five
+The maintenance workflow automatically uses this manifest after all six
 logical template names below have been captured:
 
 | Template name | Capture when | Clickable |
 | --- | --- | --- |
+| `dismantle_open` | Normal inventory is open and its bottom-right gold 分解 button is visible | yes |
 | `dismantle_ready` | The gold/enabled 分解 button is ready | yes |
 | `dismantle_empty` | 没有可选择的道具 is visible | no |
 | `dismantle_confirm` | A dismantle confirmation/warning/result prompt is foreground | yes |
@@ -17,6 +18,7 @@ Capture each template while the game is manually positioned on that screen:
 cd python-autodnf
 source .venv/bin/activate
 
+python tools/crop_template.py dismantle_open --clickable
 python tools/crop_template.py dismantle_ready --clickable
 python tools/crop_template.py dismantle_empty
 python tools/crop_template.py dismantle_confirm --clickable
@@ -71,4 +73,4 @@ python tools/check_templates.py --input path/to/window.png
 The generated `manifest.json` stores top-left-origin normalized positions, so
 the same templates can be used at another window resolution with the same
 layout. The workflow falls back to its previous OCR implementation until the
-complete five-name set exists.
+complete six-name set exists.
