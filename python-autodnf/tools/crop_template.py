@@ -13,7 +13,9 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-import tkinter as tk
+
+import cv2
+from PIL import Image
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -39,114 +41,55 @@ class CropTool:
         self.selection: tuple[float, float, float, float] | None = None
         self.click_point: tuple[float, float] | None = None
         self.drag_start: tuple[float, float] | None = None
-        self.preview: int | None = None
+        self.drag_end: tuple[float, float] | None = None
+        self.window_name = f"AutoDNF template crop: {name}"
 
-        self.root = tk.Tk()
-        self.root.title(f"AutoDNF template crop: {name}")
-        self.canvas = tk.Canvas(self.root, highlightthickness=0)
-        self.x_scroll = tk.Scrollbar(self.root, orient="horizontal", command=self.canvas.xview)
-        self.y_scroll = tk.Scrollbar(self.root, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(xscrollcommand=self.x_scroll.set, yscrollcommand=self.y_scroll.set)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.y_scroll.grid(row=0, column=1, sticky="ns")
-        self.x_scroll.grid(row=1, column=0, sticky="ew")
-        self.status = tk.Label(self.root, anchor="w")
-        self.status.grid(row=2, column=0, columnspan=2, sticky="ew")
-        self.root.grid_rowconfigure(0, weight=1)
-        self.root.grid_columnconfigure(0, weight=1)
-        self.root.geometry("1100x760")
-
-        self.photo = tk.PhotoImage(file=source)
-        self.width, self.height = self.photo.width(), self.photo.height()
-        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
-        self.canvas.configure(scrollregion=(0, 0, self.width, self.height))
-        self.canvas.bind("<ButtonPress-1>", self.start_crop)
-        self.canvas.bind("<B1-Motion>", self.drag_crop)
-        self.canvas.bind("<ButtonRelease-1>", self.finish_crop)
-        self.canvas.bind("<Button-2>", self.set_click)
-        self.canvas.bind("<Button-3>", self.set_click)
-        self.root.bind_all("<KeyPress>", self.key)
+        self.frame = cv2.imread(str(source), cv2.IMREAD_COLOR)
+        if self.frame is None:
+            raise RuntimeError(f"Could not decode screenshot: {source}")
+        self.height, self.width = self.frame.shape[:2]
+        # macOS window captures are commonly Retina-sized. Scale the preview
+        # to a practical desktop window while retaining original coordinates.
+        self.scale = min(1.0, 1400 / self.width, 900 / self.height)
+        if self.scale < 1.0:
+            self.preview_frame = cv2.resize(
+                self.frame,
+                (round(self.width * self.scale), round(self.height * self.scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            self.preview_frame = self.frame.copy()
+        self.status_text = ""
         self.update_status()
 
-    def canvas_point(self, event: tk.Event) -> tuple[float, float]:
+    def image_point(self, x: int, y: int) -> tuple[float, float]:
         return (
-            min(self.width, max(0, self.canvas.canvasx(event.x))),
-            min(self.height, max(0, self.canvas.canvasy(event.y))),
+            min(self.width, max(0, x / self.scale)),
+            min(self.height, max(0, y / self.scale)),
         )
 
-    def start_crop(self, event: tk.Event) -> None:
-        self.drag_start = self.canvas_point(event)
-
-    def drag_crop(self, event: tk.Event) -> None:
+    def finish_crop(self, end: tuple[float, float]) -> None:
         if self.drag_start is None:
             return
-        if self.preview is not None:
-            self.canvas.delete(self.preview)
-        self.preview = self.canvas.create_rectangle(
-            *self.drag_start,
-            *self.canvas_point(event),
-            outline="#ffd23f",
-            width=3,
-        )
-
-    def finish_crop(self, event: tk.Event) -> None:
-        if self.drag_start is None:
-            return
-        end = self.canvas_point(event)
         left, right = sorted((self.drag_start[0], end[0]))
         top, bottom = sorted((self.drag_start[1], end[1]))
         self.drag_start = None
+        self.drag_end = None
         if right - left < 8 or bottom - top < 8:
             return
         self.selection = left, top, right, bottom
         self.click_point = None
-        self.redraw()
+        self.update_status()
 
-    def set_click(self, event: tk.Event) -> str:
+    def set_click(self, point: tuple[float, float]) -> None:
         if self.selection is None:
-            self.status.config(text="Draw the match crop before setting its click point")
-            return "break"
-        point = self.canvas_point(event)
+            self.status_text = "Draw the match crop before setting its click point"
+            return
         left, top, right, bottom = self.selection
         if not (left <= point[0] <= right and top <= point[1] <= bottom):
-            self.status.config(text="The click point must be inside the selected crop")
-            return "break"
+            self.status_text = "The click point must be inside the selected crop"
+            return
         self.click_point = point
-        self.redraw()
-        return "break"
-
-    def redraw(self) -> None:
-        self.canvas.delete("template-overlay")
-        if self.preview is not None:
-            self.canvas.delete(self.preview)
-            self.preview = None
-        if self.selection is not None:
-            self.canvas.create_rectangle(
-                *self.selection,
-                outline="#ffd23f",
-                width=3,
-                tags="template-overlay",
-            )
-        if self.click_point is not None:
-            x, y = self.click_point
-            self.canvas.create_line(
-                x - 10,
-                y,
-                x + 10,
-                y,
-                fill="#ff5252",
-                width=3,
-                tags="template-overlay",
-            )
-            self.canvas.create_line(
-                x,
-                y - 10,
-                x,
-                y + 10,
-                fill="#ff5252",
-                width=3,
-                tags="template-overlay",
-            )
         self.update_status()
 
     def update_status(self) -> None:
@@ -160,15 +103,68 @@ class CropTool:
                 f" | region=({left / self.width:.4f}, {top / self.height:.4f}, "
                 f"{right / self.width:.4f}, {bottom / self.height:.4f})"
             )
-        self.status.config(text=instruction)
+        self.status_text = instruction
 
-    def save(self) -> None:
+    def mouse(
+        self,
+        event: int,
+        x: int,
+        y: int,
+        _flags: int,
+        _parameter: object,
+    ) -> None:
+        point = self.image_point(x, y)
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.drag_start = point
+            self.drag_end = point
+        elif event == cv2.EVENT_MOUSEMOVE and self.drag_start is not None:
+            self.drag_end = point
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.finish_crop(point)
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            self.set_click(point)
+
+    def render(self):
+        rendered = self.preview_frame.copy()
+        region = self.selection
+        if self.drag_start is not None and self.drag_end is not None:
+            region = (*self.drag_start, *self.drag_end)
+        if region is not None:
+            left, top, right, bottom = region
+            cv2.rectangle(
+                rendered,
+                (round(left * self.scale), round(top * self.scale)),
+                (round(right * self.scale), round(bottom * self.scale)),
+                (63, 210, 255),
+                3,
+            )
+        if self.click_point is not None:
+            x = round(self.click_point[0] * self.scale)
+            y = round(self.click_point[1] * self.scale)
+            cv2.line(rendered, (x - 10, y), (x + 10, y), (82, 82, 255), 3)
+            cv2.line(rendered, (x, y - 10), (x, y + 10), (82, 82, 255), 3)
+
+        # Keep instructions readable regardless of the captured scene.
+        cv2.rectangle(rendered, (0, 0), (rendered.shape[1], 34), (0, 0, 0), -1)
+        cv2.putText(
+            rendered,
+            self.status_text,
+            (10, 23),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        return rendered
+
+    def save(self) -> bool:
         if self.selection is None:
-            self.status.config(text="No crop selected")
-            return
+            self.status_text = "No crop selected"
+            return False
         if self.clickable and self.click_point is None:
-            self.status.config(text="Right-click the action point before saving")
-            return
+            self.status_text = "Right-click the action point before saving"
+            return False
         self.manifest.parent.mkdir(parents=True, exist_ok=True)
         images = self.manifest.parent / "images"
         images.mkdir(parents=True, exist_ok=True)
@@ -182,8 +178,6 @@ class CropTool:
         destination = images / f"{self.name}_{index:02d}.png"
 
         left, top, right, bottom = self.selection
-        from PIL import Image
-
         with Image.open(self.source) as source:
             source.crop((round(left), round(top), round(right), round(bottom))).save(destination)
         entry: dict[str, object] = {
@@ -213,16 +207,23 @@ class CropTool:
         print(f"Normalized top-left region: {entry['region']}")
         if "click_offset" in entry:
             print(f"Click offset inside crop: {entry['click_offset']}")
-        self.root.destroy()
-
-    def key(self, event: tk.Event) -> None:
-        if event.keysym.lower() == "s":
-            self.save()
-        elif event.keysym.lower() == "q":
-            self.root.destroy()
+        return True
 
     def run(self) -> None:
-        self.root.mainloop()
+        cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
+        cv2.setMouseCallback(self.window_name, self.mouse)
+        try:
+            while True:
+                cv2.imshow(self.window_name, self.render())
+                key = cv2.waitKey(20) & 0xFF
+                if key == ord("s") and self.save():
+                    break
+                if key in (ord("q"), 27):
+                    break
+                if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+        finally:
+            cv2.destroyWindow(self.window_name)
 
 
 def capture_window(destination: Path, hint: str) -> None:
