@@ -79,6 +79,13 @@ class AutoDNF:
     CHARACTER_BOARD_LEVEL_STRIP = (0.078, 0.145)
     CHARACTER_BOARD_FATIGUE_STRIP = (0.285, 0.385)
     CHARACTER_BOARD_ONLINE_STRIP = (0.078, 0.175)
+    # The battle companion picker is a fixed three-column rolling grid.
+    # Vision coordinates use a bottom-left origin, while the panel rectangle
+    # used for image comparison uses a top-left origin.
+    PARTY_PICKER_PANEL = (0.14, 0.35, 0.88, 0.76)
+    PARTY_PICKER_ROW_PITCH = 0.16
+    PARTY_PICKER_ROW_CENTERS = (0.57, 0.41, 0.25)
+    PARTY_PICKER_COLUMN_CENTERS = (0.267, 0.511, 0.755)
     # Page-level back arrows (邮箱 / 背包) sit below and right of the app
     # window's outer top-left edge.
     PAGE_BACK_POINT = (0.04, 0.94)
@@ -97,10 +104,6 @@ class AutoDNF:
         "dismantle_confirm",
         "dismantle_close",
     )
-    # macOS hardware keycodes, in the requested in-game attack order:
-    # A, S, F, G, Q, W, E, R, X, V, T, B.
-    SOLO_SKILL_KEYS = (0, 1, 3, 5, 12, 13, 14, 15, 7, 9, 17, 11)
-
     def __init__(
         self,
         client: MacClient,
@@ -116,8 +119,6 @@ class AutoDNF:
         self.vision_auto_act = vision_auto_act
         self.template_matcher = template_matcher
         self.in_dungeon = False
-        self.solo_battle = False
-        self.solo_skill_index = 0
         self.special_signin_dismiss_attempts = 0
         self.character_traversal_started = False
 
@@ -441,7 +442,10 @@ class AutoDNF:
         boxes: list[TextBox],
     ) -> bool:
         """Close the post-login 星源石 promotion at its stable upper-right X."""
-        if self.in_dungeon or not self.client.execute:
+        # Unlike generic popup recovery, this uniquely identified promotion is
+        # safe to close even while the battle loop's in_dungeon flag remains
+        # true during the transition back to town.
+        if not self.client.execute:
             return False
         visible = sum(
             bool(find(text, boxes))
@@ -1624,9 +1628,6 @@ class AutoDNF:
             return "时空秘境 town"
 
     def configure_party(self) -> bool:
-        # A new formation determines whether battle needs the active solo
-        # attack rotation. Existing full formations always use normal movement.
-        self.solo_battle = False
         deadline = time.monotonic() + 8
         slot_point: tuple[float, float] | None = None
         current_fatigue: int | None = None
@@ -1697,6 +1698,14 @@ class AutoDNF:
         card_deadline = time.monotonic() + 12
         scrolls = 0
         unchanged_scrolls = 0
+        # PlayCover occasionally drops a drag that starts over an animated
+        # card. Cycle across different horizontal lanes and progressively
+        # stronger vertical strokes before concluding the list is at bottom.
+        scroll_profiles = (
+            ((0.50, 0.30), (0.50, 0.30 + self.PARTY_PICKER_ROW_PITCH), 0.82),
+            ((0.40, 0.30), (0.40, 0.30 + self.PARTY_PICKER_ROW_PITCH), 0.88),
+            ((0.60, 0.30), (0.60, 0.30 + self.PARTY_PICKER_ROW_PITCH), 0.88),
+        )
         attempted_points: set[tuple[float, float]] = set()
         announced_card_wait = False
         while companions_selected < 2:
@@ -1723,6 +1732,24 @@ class AutoDNF:
                 if observed < companions_selected:
                     print("Selection marker was not OCR-visible after click; card was fatigue-verified before clicking")
                 continue
+
+            locked_tail = find("前置任务", boxes)
+            fatigue_empty = find("疲劳值不足", boxes)
+            if len(locked_tail) >= 4 or (
+                len(locked_tail) >= 3 and len(fatigue_empty) >= 2
+            ):
+                if self.debug:
+                    print(
+                        f"Detected {len(locked_tail)} locked character cells "
+                        "in the picker tail"
+                    )
+                print("Detected locked character rows; party picker is at the bottom")
+                return self.save_party_formation(
+                    window,
+                    boxes,
+                    companions_selected,
+                    exhausted=True,
+                )
 
             # Allow the animated cards to finish rendering before deciding that
             # their visible fatigue values are all exhausted.
@@ -1752,30 +1779,48 @@ class AutoDNF:
                 )
             before = self.client.capture_png_bytes(window)
             scrolls += 1
-            print(f"No eligible companion on this picker view; scrolling down ({scrolls})")
+            profile = scroll_profiles[
+                min(unchanged_scrolls, len(scroll_profiles) - 1)
+            ]
+            print(
+                f"No eligible companion on this picker view; scrolling down "
+                f"({scrolls}, drag profile {min(unchanged_scrolls + 1, len(scroll_profiles))}/"
+                f"{len(scroll_profiles)})"
+            )
             self.client.drag(
                 window,
-                start=(0.50, 0.30),
-                end=(0.50, 0.70),
+                start=profile[0],
+                end=profile[1],
                 label="party character list downward",
+                duration=profile[2],
             )
             time.sleep(0.7)
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             after = self.client.capture_png_bytes(window)
-            difference = self.client.region_difference(before, after, (0.13, 0.25, 0.88, 0.80))
+            difference = self.client.region_difference(
+                before,
+                after,
+                self.PARTY_PICKER_PANEL,
+            )
             if difference is not None and difference < 2.5:
                 unchanged_scrolls += 1
-                print(f"Party picker did not move (difference {difference:.2f}; {unchanged_scrolls}/2)")
+                print(
+                    f"Party picker did not move (difference {difference:.2f}; "
+                    f"{unchanged_scrolls}/{len(scroll_profiles)})"
+                )
             else:
                 unchanged_scrolls = 0
                 if difference is None:
                     print("Party-picker movement could not be measured; continuing with OCR")
                 else:
                     print(f"Party picker moved (difference {difference:.2f})")
-            if unchanged_scrolls >= 2:
+            if unchanged_scrolls >= len(scroll_profiles):
                 self.eligible_cards(boxes, target_fatigue=current_fatigue, emit_debug=True)
-                print("Reached the bottom of the party character list with no eligible companion")
+                print(
+                    "Party picker remained unchanged after every drag profile; "
+                    "treating this as the bottom of the list"
+                )
                 return self.save_party_formation(
                     window,
                     boxes,
@@ -1794,18 +1839,22 @@ class AutoDNF:
         companions_selected: int,
         exhausted: bool = False,
     ) -> bool:
-        """Save a complete, partial, or solo formation and return to entry UI."""
-        self.solo_battle = companions_selected == 0
-        if self.solo_battle:
-            self.solo_skill_index = 0
+        """Save a complete or partial formation, but never a solo formation."""
+        if companions_selected == 0:
+            print(
+                "No eligible companion could be added; cancelling party "
+                "setup and stopping before dungeon entry"
+            )
+            # Escape is delivered to PlayCover as Android Back and safely
+            # closes the character picker without saving a solo formation.
+            self.client.press(53)
+            time.sleep(0.8)
+            return False
         if exhausted:
-            if companions_selected:
-                print(
-                    f"No further eligible companion found; entering with "
-                    f"{companions_selected} selected companion(s)"
-                )
-            else:
-                print("No eligible companion found; entering the dungeon solo")
+            print(
+                f"No further eligible companion found; entering with "
+                f"{companions_selected} selected companion(s)"
+            )
         complete = exact("编队完成", boxes)
         if len(complete) != 1:
             raise RuntimeError("Could not identify formation-complete button")
@@ -1827,10 +1876,7 @@ class AutoDNF:
                     break
                 time.sleep(0.4)
             if picker_absent_frames >= 2:
-                if self.solo_battle:
-                    print("Solo formation saved; battle will move right while cycling attack skills")
-                else:
-                    print("Party formation saved")
+                print("Party formation saved")
                 return True
             print(f"编队完成 did not close the picker; retrying ({attempt}/3)")
             complete = exact("编队完成", boxes)
@@ -1863,6 +1909,9 @@ class AutoDNF:
         while time.monotonic() < deadline:
             window = self.client.find_window()
             boxes = self.client.ocr(window)
+            if self.dismiss_known_epic_stone_popup(window, boxes):
+                town_frames = 0
+                continue
             if (
                 find("秘境：", boxes)
                 or find("再次挑战", boxes)
@@ -1938,33 +1987,11 @@ class AutoDNF:
                 continue
             town_frames = 0
             if find("秘境：", boxes) or len(find("/100", boxes)) >= 3:
-                if self.solo_battle:
-                    self.solo_advance_and_attack()
-                else:
-                    self.client.hold([124], 0.8)  # right arrow
+                self.client.hold([124], 0.8)  # right arrow
                 time.sleep(0.4)
                 continue
             time.sleep(0.8)
         raise TimeoutError("Battle safety limit reached")
-
-    def solo_advance_and_attack(self) -> None:
-        """Advance while sending one deliberately paced solo skill press.
-
-        A full 12-key burst was unnecessarily aggressive for PlayCover and
-        could destabilise the game during combat. One key per movement tick
-        retains the requested ordered rotation while limiting injected events.
-        """
-        keycode = self.SOLO_SKILL_KEYS[self.solo_skill_index]
-        self.solo_skill_index = (self.solo_skill_index + 1) % len(self.SOLO_SKILL_KEYS)
-        if self.debug:
-            print(f"Solo advance-and-attack: skill keycode {keycode}")
-        self.client.hold_and_press_sequence(
-            124,  # Right Arrow
-            (keycode,),
-            key_duration=0.12,
-            interval=0.08,
-            movement_tail=0.50,
-        )
 
     def enter_dungeon(self) -> None:
         window, boxes = self.wait_for(["入场", "入场材料"], "ready formation")
@@ -2158,7 +2185,7 @@ class AutoDNF:
         target_fatigue: int | None = None,
         emit_debug: bool | None = None,
     ) -> list[tuple[int, tuple[float, float]]]:
-        row_centers = (0.57, 0.41, 0.25)
+        row_centers = self.PARTY_PICKER_ROW_CENTERS
 
         def column(x: float) -> int:
             return 0 if x < 0.39 else 1 if x < 0.65 else 2
@@ -2185,7 +2212,7 @@ class AutoDNF:
         # fatigue.
         candidates: list[tuple[int, tuple[float, float]]] = []
         for row_index, y in enumerate(row_centers):
-            for card_column, x in enumerate((0.267, 0.511, 0.755)):
+            for card_column, x in enumerate(self.PARTY_PICKER_COLUMN_CENTERS):
                 is_selected = any(
                     column(item.center[0]) == card_column
                     and row(item.center[1]) == row_index
