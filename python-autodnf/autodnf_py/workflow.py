@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+from dataclasses import dataclass
 
 from .detector import LootPileDetector
 from .macos import MacClient, TextBox, Window
@@ -24,6 +25,18 @@ def exact(text: str, boxes: list[TextBox]) -> list[TextBox]:
     return [box for box in boxes if box.normalized == target]
 
 
+@dataclass(frozen=True)
+class CharacterBoardRow:
+    """One fully visible, geometry-calibrated character-board row."""
+
+    top: float
+    bottom: float
+    click_y: float
+    level: int | None
+    fatigue: int | None
+    online: bool
+
+
 class AutoDNF:
     # This full-screen event promotion blocks the town UI but has a stable,
     # harmless close X. Its text is used as the required local gate; the click
@@ -38,6 +51,17 @@ class AutoDNF:
     # has already been granted and its items were sent to mail. The generic
     # 确认 button is safe only when these distinctive message fragments coexist.
     RIFT_REWARD_MAIL_POPUP_TEXTS = ("普通秘境", "经验值", "邮件发放")
+    # Post-login 星源石 acquisition promotion. Its artwork varies by the
+    # awarded stone, but the congratulation/button vocabulary and close-X
+    # position are stable.
+    EPIC_STONE_POPUP_TEXTS = (
+        "星源石",
+        "恭喜冒险家",
+        "冻结心",
+        "技能攻击力",
+        "祝贺老板",
+    )
+    EPIC_STONE_POPUP_CLOSE = (0.835, 0.808)
     # Full-screen 8-day special sign-in artwork has no visible close control.
     # It is identified by both its headline and repeated day-card labels.
     SPECIAL_SIGNIN_POPUP_HEADLINES = ("8日特别签到", "新深渊")
@@ -48,6 +72,13 @@ class AutoDNF:
     CHARACTER_SELECT_POINT = (0.04, 0.82)
     # The 挑战进度 board's X is lower than a standard dialog title-bar X.
     CHARACTER_BOARD_CLOSE_POINT = (0.94, 0.87)
+    # Calibrated from 2956x1718 window-only captures. Coordinates below use a
+    # top-left origin; the runtime scales them to the current window size.
+    CHARACTER_BOARD_PANEL = (0.078, 0.253, 0.922, 0.827)
+    CHARACTER_BOARD_ROW_PITCH = 214 / 1718
+    CHARACTER_BOARD_LEVEL_STRIP = (0.078, 0.145)
+    CHARACTER_BOARD_FATIGUE_STRIP = (0.285, 0.385)
+    CHARACTER_BOARD_ONLINE_STRIP = (0.078, 0.175)
     # Page-level back arrows (邮箱 / 背包) sit below and right of the app
     # window's outer top-left edge.
     PAGE_BACK_POINT = (0.04, 0.94)
@@ -88,6 +119,7 @@ class AutoDNF:
         self.solo_battle = False
         self.solo_skill_index = 0
         self.special_signin_dismiss_attempts = 0
+        self.character_traversal_started = False
 
     def wait_for(self, texts: list[str], state: str, timeout: float = 18) -> tuple[Window, list[TextBox]]:
         _, window, boxes = self.wait_for_any({state: texts}, timeout)
@@ -134,6 +166,9 @@ class AutoDNF:
                 delay = 0.4
                 continue
             if self.dismiss_known_guild_signin_popup(window, boxes):
+                delay = 0.4
+                continue
+            if self.dismiss_known_epic_stone_popup(window, boxes):
                 delay = 0.4
                 continue
             # A known town activity promotion can appear before any workflow
@@ -400,6 +435,31 @@ class AutoDNF:
         time.sleep(0.8)
         return True
 
+    def dismiss_known_epic_stone_popup(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Close the post-login 星源石 promotion at its stable upper-right X."""
+        if self.in_dungeon or not self.client.execute:
+            return False
+        visible = sum(
+            bool(find(text, boxes))
+            for text in self.EPIC_STONE_POPUP_TEXTS
+        )
+        # Require two independent artwork labels so ordinary town text can
+        # never trigger the fixed close-point click.
+        if visible < 2:
+            return False
+        print("Detected post-login 星源石 promotion; clicking its close X")
+        self.client.click(
+            window,
+            self.EPIC_STONE_POPUP_CLOSE,
+            "close 星源石 promotion",
+        )
+        time.sleep(0.8)
+        return True
+
     def dismiss_known_special_signin_popup(
         self,
         window: Window,
@@ -507,9 +567,8 @@ class AutoDNF:
         processed: set[str] = set()
         completed = 0
         while True:
-            # Re-open the board from town and scan from its top. The OCR row
-            # fingerprint prevents us from selecting a previously processed
-            # character after the list has been reset.
+            # Start once at the top, then traverse only below the calibrated
+            # green 在线 row. No character name or OCR fingerprint is used.
             if not self.switch_to_available_character(
                 processed=processed,
                 reset_to_top=(completed == 0),
@@ -523,7 +582,19 @@ class AutoDNF:
             if self.receive_all_character_mail():
                 self.dismantle_all_available_equipment()
             else:
-                print("Skipping this character because its backpack is full")
+                print(
+                    "Backpack is full; dismantling first to create room, "
+                    "then retrying mail once"
+                )
+                self.dismantle_all_available_equipment()
+                if self.receive_all_character_mail():
+                    # Newly claimed equipment may itself be dismantleable.
+                    self.dismantle_all_available_equipment()
+                else:
+                    print(
+                        "Backpack is still full after dismantling; moving to "
+                        "the next character"
+                    )
 
     def receive_all_character_mail(self) -> bool:
         """Open character mail, claim all mail when present, then return to town."""
@@ -543,32 +614,128 @@ class AutoDNF:
             claim = exact("领取全部物品", boxes)
             if len(claim) == 1:
                 self.client.click(window, claim[0].center, "claim all mail items")
-                try:
-                    state, window, boxes = self.wait_for_any(
-                        {
-                            "backpack full": ["背包已满"],
-                            # The mailbox remains OCR-visible while the reward
-                            # dialog animates in. Require foreground-specific
-                            # text so the background cannot win this race.
-                            "mail claim reward": ["获得道具", "确认"],
-                        },
-                        timeout=12,
+                state, window, boxes = self.wait_for_mail_claim_result()
+                if state == "backpack full":
+                    print("Detected 背包已满 while claiming mail; leaving this character untouched")
+                    skip_character = True
+                elif state == "mail claim reward":
+                    self.click_topmost_right_confirmation(
+                        window,
+                        boxes,
+                        "confirm mail claim",
                     )
-                    if state == "backpack full":
-                        print("Detected 背包已满 while claiming mail; leaving this character untouched")
-                        skip_character = True
-                    elif state == "mail claim reward":
-                        self.click_topmost_right_confirmation(window, boxes, "confirm mail claim")
-                        self.wait_for(["角色邮件"], "mailbox after claim", timeout=12)
-                        print("Claimed all character mail")
-                except TimeoutError:
+                    self.wait_for_settled_mailbox_after_claim()
+                    print("Claimed all character mail")
+                else:
                     # A disabled claim button can remain OCR-visible when the
-                    # mailbox has no attachments. Do not retry that click.
+                    # mailbox has no attachments. It is considered empty only
+                    # after a long foreground-free settling interval.
                     print("Mail claim did not open a reward dialog; treating mailbox as empty")
             else:
                 print("No enabled claim-all mail button was detected")
         self.return_to_town_from_page("邮箱", "mailbox")
         return not skip_character
+
+    def wait_for_mail_claim_result(
+        self,
+        timeout: float = 20,
+    ) -> tuple[str, Window, list[TextBox]]:
+        """Wait through claim animation until a foreground result is stable."""
+        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        previous_confirm: tuple[float, float] | None = None
+        stable_confirm_frames = 0
+        stable_backpack_full_frames = 0
+        settled_mailbox_frames = 0
+        while time.monotonic() < deadline:
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+
+            reward_title = bool(find("获得道具", boxes))
+            reward_actions = bool(find("立即使用", boxes)) and bool(
+                find("穿戴", boxes)
+            )
+            reward_dialog = reward_title or reward_actions
+            confirmations = [
+                box
+                for box in exact("确认", boxes)
+                if 0.48 < box.center[0] < 0.76
+                and 0.12 < box.center[1] < 0.48
+            ]
+            if reward_dialog and len(confirmations) == 1:
+                center = confirmations[0].center
+                if (
+                    previous_confirm is not None
+                    and abs(center[0] - previous_confirm[0]) < 0.015
+                    and abs(center[1] - previous_confirm[1]) < 0.015
+                ):
+                    stable_confirm_frames += 1
+                else:
+                    stable_confirm_frames = 1
+                previous_confirm = center
+                if stable_confirm_frames >= 2:
+                    print("Mail reward dialog finished rendering")
+                    return "mail claim reward", window, boxes
+            else:
+                previous_confirm = None
+                stable_confirm_frames = 0
+
+            # Foreground reward rendering takes precedence over any stale
+            # 背包已满 text still OCR-visible in the mailbox behind it.
+            backpack_full = [
+                box
+                for box in find("背包已满", boxes)
+                if 0.22 < box.center[0] < 0.78
+                and 0.18 < box.center[1] < 0.78
+            ]
+            foreground_visible = reward_dialog or bool(confirmations)
+            if backpack_full and not foreground_visible:
+                stable_backpack_full_frames += 1
+                if (
+                    time.monotonic() - started >= 3.0
+                    and stable_backpack_full_frames >= 3
+                ):
+                    print("Backpack-full state remained stable after mail claim")
+                    return "backpack full", window, boxes
+            else:
+                stable_backpack_full_frames = 0
+
+            # Do not let the always-visible background mailbox win while the
+            # foreground dialog is still delayed or partially rendered.
+            if find("角色邮件", boxes) and not foreground_visible:
+                settled_mailbox_frames += 1
+            else:
+                settled_mailbox_frames = 0
+            if (
+                time.monotonic() - started >= 8.0
+                and settled_mailbox_frames >= 3
+            ):
+                return "no reward", window, boxes
+            time.sleep(0.4)
+        raise TimeoutError("Timed out waiting for the mail-claim result to finish rendering")
+
+    def wait_for_settled_mailbox_after_claim(self, timeout: float = 15) -> None:
+        """Require the reward overlay to disappear before clicking mailbox Back."""
+        deadline = time.monotonic() + timeout
+        stable_frames = 0
+        while time.monotonic() < deadline:
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+            centered_confirmation = any(
+                0.38 < box.center[0] < 0.76
+                and 0.12 < box.center[1] < 0.55
+                for box in exact("确认", boxes)
+            )
+            reward_visible = bool(find("获得道具", boxes)) or centered_confirmation
+            if find("角色邮件", boxes) and not reward_visible:
+                stable_frames += 1
+                if stable_frames >= 3:
+                    print("Detected settled mailbox after claim")
+                    return
+            else:
+                stable_frames = 0
+            time.sleep(0.4)
+        raise TimeoutError("Mail reward overlay did not finish closing")
 
     def dismantle_all_available_equipment(self) -> None:
         """Repeatedly dismantle all selectable equipment, then return to town."""
@@ -713,6 +880,12 @@ class AutoDNF:
                     timeout=10,
                 )
                 if next_state.name != "dismantle_confirm":
+                    # The panel can become briefly readable before the
+                    # dismantle-result reward dialog finishes animating in.
+                    # Give that foreground dialog a short, explicit window to
+                    # appear and acknowledge it before beginning the next
+                    # template-only panel wait.
+                    self.dismiss_dismantle_reward_popup()
                     break
                 prompt = next_state
             else:
@@ -737,6 +910,56 @@ class AutoDNF:
         )
         self.client.click(window, self.PAGE_BACK_POINT, "back from inventory")
         self.wait_for(["委托", "选角"], "town after inventory exit", timeout=25)
+
+    def dismiss_dismantle_reward_popup(self, timeout: float = 3.0) -> bool:
+        """Acknowledge the delayed 获得道具 dialog after a dismantle batch."""
+        deadline = time.monotonic() + timeout
+        visible_frames = 0
+        while time.monotonic() < deadline:
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+            if find("获得道具", boxes):
+                visible_frames += 1
+                choices = [
+                    box
+                    for box in exact("确认", boxes)
+                    if 0.38 < box.center[0] < 0.68
+                    and 0.20 < box.center[1] < 0.55
+                ]
+                if len(choices) == 1:
+                    print("Detected delayed dismantle reward dialog")
+                    self.client.click(
+                        window,
+                        choices[0].center,
+                        "confirm dismantle rewards",
+                    )
+                    time.sleep(0.8)
+                    return True
+                if visible_frames >= 2:
+                    # The title uniquely gates this one-button dismantle
+                    # result. If Vision drops the button glyph, use its fixed
+                    # centered position rather than allowing the next panel
+                    # template wait to time out behind the modal.
+                    print(
+                        "Detected delayed dismantle reward dialog; using its "
+                        "fixed centered confirmation point"
+                    )
+                    self.client.click(
+                        window,
+                        (0.52, 0.35),
+                        "confirm dismantle rewards",
+                    )
+                    time.sleep(0.8)
+                    return True
+                if self.debug:
+                    print(
+                        "Dismantle reward dialog is visible but its centered "
+                        f"确认 button is not stable yet ({len(choices)} candidate(s))"
+                    )
+            else:
+                visible_frames = 0
+            time.sleep(0.3)
+        return False
 
     def wait_for_template_any(
         self,
@@ -907,7 +1130,9 @@ class AutoDNF:
             print("Character selection did not open after three safe recovery attempts")
             return False
 
-        if reset_to_top:
+        if reset_to_top or (
+            processed is None and not self.character_traversal_started
+        ):
             window, boxes = self.scroll_character_board_to_top(window, boxes)
 
         board_deadline = time.monotonic() + 90
@@ -919,112 +1144,91 @@ class AutoDNF:
         # marker itself moves off-screen.
         passed_online_row = not bool(processed)
         while True:
-            # The small green 在线 badge is the traversal anchor after the
-            # first role. Re-read its fixed left strip independently because
-            # the full-window pass can omit it among the board's dense text.
-            focused_online = (
-                self.client.ocr_region(
-                    window,
-                    (0.08, 0.18, 0.14, 0.60),
-                    language_correction=True,
-                )
-                if processed
-                else []
-            )
-            marker_boxes = [
-                *boxes,
-                *[box for box in focused_online if box.normalized == "在线"],
-            ]
-            visible_fatigue_rows = self.character_board_fatigue_rows(boxes)
-            analysis_boxes = boxes
-            if any(fatigue >= 10 for _, fatigue in visible_fatigue_rows):
-                # The small gold level badge is frequently read as `8` rather
-                # than `80` in a full-window Chinese OCR pass. Re-read just
-                # the left badge strip with language correction disabled so
-                # the numeric glyphs receive independent recognition.
-                focused_levels = self.client.ocr_region(
-                    window,
-                    (0.06, 0.16, 0.20, 0.64),
-                    language_correction=False,
-                )
-                analysis_boxes = [*boxes, *focused_levels]
-                if self.debug:
-                    values = ", ".join(box.text for box in focused_levels) or "none"
-                    print(f"Focused level-badge OCR: {values}")
-            fatigue_rows = self.character_board_rows(analysis_boxes)
-            if self.debug and fatigue_rows:
-                pairs = ", ".join(
-                    f"level {level}: {fatigue}/100 at y={row_y:.3f}"
-                    for fatigue, level, row_y in fatigue_rows
-                )
-                print(f"Character-board fatigue/level pairs: {pairs}")
-            available = sorted(
-                (
-                    (
-                        fatigue,
-                        level,
-                        row_y,
-                        self.character_board_row_identity(boxes, row_y, level, fatigue),
+            frame = self.client.capture_png_bytes(window)
+            rows = self.character_board_calibrated_rows(window, frame)
+            if self.debug:
+                if rows:
+                    values = ", ".join(
+                        f"slot {index + 1}: level={row.level}, "
+                        f"fatigue={row.fatigue}, online={row.online}, "
+                        f"y={row.click_y:.3f}"
+                        for index, row in enumerate(rows)
                     )
-                    for fatigue, level, row_y in fatigue_rows
-                    if fatigue >= minimum_fatigue and level >= 75
-                ),
-                # Pick the first visible available role rather than ranking
-                # power/fatigue: scroll order is predictable across accounts.
-                key=lambda item: -item[2],
-            )
-            if processed is not None:
-                available = [candidate for candidate in available if candidate[3] not in processed]
-                # After the first maintenance role, traversal is monotonic:
-                # never reselect the current green 在线 row, and when it is
-                # visible choose only roles physically below it. This remains
-                # stable even when OCR changes the current role's fingerprint.
-                if processed:
-                    online_rows = [
-                        row_y
-                        for _, _, row_y in fatigue_rows
-                        if self.character_board_row_is_online(marker_boxes, row_y)
+                    print(f"Calibrated character-board rows: {values}")
+                else:
+                    print("No complete character-board row borders detected")
+            available = [
+                row
+                for row in rows
+                if row.level is not None
+                and row.fatigue is not None
+                and row.level >= 75
+                and row.fatigue >= minimum_fatigue
+            ]
+            initial_prefix_unreadable = False
+            if not processed and available:
+                # At the initial top-of-list scan, never treat the current
+                # 在线 row as the first eligible character merely because OCR
+                # missed a preceding row's level or fatigue. Every complete
+                # row above the candidate must be conclusively readable; an
+                # unreadable predecessor causes a safe in-place retry.
+                candidate_index = rows.index(available[0])
+                unreadable_before = [
+                    row
+                    for row in rows[:candidate_index]
+                    if row.level is None or row.fatigue is None
+                ]
+                if unreadable_before:
+                    initial_prefix_unreadable = True
+                    if self.debug:
+                        print(
+                            "A row above the first detected eligible character "
+                            "is not fully readable; retrying before selecting "
+                            "or reusing the 在线 role"
+                        )
+                    available = []
+            elif not processed:
+                initial_prefix_unreadable = any(
+                    row.level is None or row.fatigue is None
+                    for row in rows
+                )
+            if processed:
+                online_rows = [row for row in rows if row.online]
+                if len(online_rows) == 1:
+                    online = online_rows[0]
+                    passed_online_row = True
+                    available = [
+                        row
+                        for row in available
+                        if row.top >= online.bottom - 0.01
                     ]
-                    if online_rows:
-                        online_y = max(online_rows)
-                        passed_online_row = True
-                        available = [
-                            candidate
-                            for candidate in available
-                            if candidate[2] < online_y - 0.045
-                        ]
-                        if self.debug:
-                            print(
-                                f"Continuing below online role at y={online_y:.3f}; "
-                                f"{len(available)} eligible row(s) remain on this view"
-                            )
-                    elif not passed_online_row:
-                        # Do not fall back to the OCR row fingerprint here.
-                        # A changed/missed character name could otherwise make
-                        # the current role look unprocessed. Wait for the
-                        # fixed-position 在线 anchor before selecting anything.
-                        available = []
-                        if self.debug:
-                            values = ", ".join(
-                                box.text for box in focused_online
-                            ) or "none"
-                            print(
-                                "Online-row anchor is not readable yet; "
-                                f"focused OCR: {values}"
-                            )
+                    if self.debug:
+                        print(
+                            f"Continuing below calibrated online slot at "
+                            f"y={online.click_y:.3f}; {len(available)} "
+                            "eligible row(s) remain"
+                        )
+                elif not passed_online_row:
+                    available = []
+                    if self.debug:
+                        print(
+                            "Calibrated 在线 slot is not readable yet; "
+                            "waiting without clicking or scrolling"
+                        )
             if available:
-                fatigue, level, row_y, identity = available[0]
+                selected = available[0]
                 if (
-                    reuse_current_if_first
+                    (reuse_current_if_first or processed is None)
                     and not processed
-                    and self.character_board_row_is_online(marker_boxes, row_y)
+                    and selected.online
                 ):
                     print(
                         f"Current character is the first eligible role "
-                        f"(level {level}); processing it without re-login"
+                        f"(level {selected.level}); processing it without re-login"
                     )
                     if processed is not None:
-                        processed.add(identity)
+                        processed.add(f"role-{len(processed) + 1}")
+                    self.character_traversal_started = True
                     self.client.click(
                         window,
                         self.CHARACTER_BOARD_CLOSE_POINT,
@@ -1032,10 +1236,17 @@ class AutoDNF:
                     )
                     self.wait_for(["委托", "选角"], "town after character-board close", timeout=15)
                     return True
-                print(f"Selecting first visible character with level {level}, {fatigue}/100 fatigue")
+                print(
+                    f"Selecting first calibrated row with level {selected.level}, "
+                    f"{selected.fatigue}/100 fatigue"
+                )
                 if processed is not None:
-                    processed.add(identity)
-                self.client.click(window, (0.45, row_y), f"available character ({fatigue}/100)")
+                    processed.add(f"role-{len(processed) + 1}")
+                self.client.click(
+                    window,
+                    (0.45, selected.click_y),
+                    f"available character ({selected.fatigue}/100)",
+                )
                 time.sleep(0.8)
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
@@ -1045,8 +1256,23 @@ class AutoDNF:
                     "new character logged into town",
                     timeout=90,
                 )
+                self.character_traversal_started = True
                 print("New character login complete")
                 return True
+
+            if initial_prefix_unreadable:
+                if time.monotonic() >= board_deadline:
+                    print(
+                        "Timed out reading the top character rows; the current "
+                        "在线 role was not reused because an earlier row could "
+                        "not be ruled out"
+                    )
+                    return False
+                stable_empty_frames = 0
+                time.sleep(0.5)
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                continue
 
             if processed and not passed_online_row:
                 if time.monotonic() >= board_deadline:
@@ -1063,13 +1289,10 @@ class AutoDNF:
                 boxes = self.client.ocr(window)
                 continue
 
-            # The title/button can render before the rows. Require two
-            # complete-looking OCR frames before treating the current view as
-            # exhausted. Then drag the card list upward to scroll downward.
-            # Scroll based on readable fatigue labels alone. Level OCR may be
-            # temporarily incomplete, but that must never trap the search on
-            # a page that visibly contains only exhausted/low-level roles.
-            if len(visible_fatigue_rows) >= 3:
+            # Require two frames with at least three complete geometric slots
+            # before scrolling. OCR values can be absent without changing the
+            # panel geometry, so unreadable text never defines row position.
+            if len(rows) >= 3:
                 stable_empty_frames += 1
             else:
                 stable_empty_frames = 0
@@ -1079,21 +1302,27 @@ class AutoDNF:
                     return False
                 before = self.client.capture_png_bytes(window)
                 scrolls += 1
-                print(f"No eligible level-75+ character on this view; scrolling character list down ({scrolls})")
-                # Vision coordinates use a bottom-left origin. Moving from
-                # y=.34 to y=.72 therefore drags physically upward, matching
-                # the game's character-list scroll gesture.
+                print(
+                    f"No eligible calibrated row on this view; scrolling "
+                    f"exactly one row down ({scrolls})"
+                )
+                # Vision y increases upward. This physical upward drag is one
+                # calibrated 214px row at the reference window height.
                 self.client.drag(
                     window,
-                    start=(0.50, 0.34),
-                    end=(0.50, 0.72),
+                    start=(0.50, 0.35),
+                    end=(0.50, 0.35 + self.CHARACTER_BOARD_ROW_PITCH),
                     label="character list downward",
                 )
                 time.sleep(0.7)
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
                 after = self.client.capture_png_bytes(window)
-                difference = self.client.region_difference(before, after, (0.12, 0.25, 0.88, 0.82))
+                difference = self.client.region_difference(
+                    before,
+                    after,
+                    self.CHARACTER_BOARD_PANEL,
+                )
                 if difference is not None and difference < 2.5:
                     unchanged_scrolls += 1
                     print(f"Character list did not move (difference {difference:.2f}; {unchanged_scrolls}/2)")
@@ -1104,19 +1333,199 @@ class AutoDNF:
                     else:
                         print(f"Character list moved (difference {difference:.2f})")
                 if unchanged_scrolls >= 2:
-                    print("Reached the bottom of the character list; no role has at least 10 fatigue")
+                    print("Reached the bottom of the character list; no eligible role remains")
                     return False
                 stable_empty_frames = 0
                 continue
             if time.monotonic() >= board_deadline:
                 print(
                     "Timed out reading an eligible role while searching the character board "
-                    f"(last frame contained {len(visible_fatigue_rows)} fatigue value(s))"
+                    f"(last frame contained {len(rows)} complete row slot(s))"
                 )
                 return False
             time.sleep(0.5)
             window = self.client.find_window()
             boxes = self.client.ocr(window)
+
+    @classmethod
+    def character_board_row_regions(
+        cls,
+        png_bytes: bytes,
+    ) -> list[tuple[float, float]]:
+        """Find complete row borders inside the calibrated rolling panel.
+
+        Rows have a fixed 214px pitch at the reference resolution. Only their
+        phase changes when the final scroll is clamped. Horizontal border
+        energy determines that phase; spans shorter than a full row are
+        discarded as clipped rows.
+        """
+        try:
+            import cv2
+            import numpy as np
+        except ImportError as error:
+            raise RuntimeError(
+                "OpenCV and NumPy are required for calibrated character rows"
+            ) from error
+        frame = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+        if frame is None:
+            raise ValueError("Could not decode character-board screenshot")
+        height, width = frame.shape
+        left, panel_top, right, panel_bottom = cls.CHARACTER_BOARD_PANEL
+        x0, x1 = round(left * width), round(right * width)
+        y0, y1 = round(panel_top * height), round(panel_bottom * height)
+        pitch = max(20, round(cls.CHARACTER_BOARD_ROW_PITCH * height))
+        strip = frame[y0:y1, x0:x1].astype("float32")
+        profile = np.abs(np.diff(strip.mean(axis=1)))
+        radius = max(4, round(pitch * 0.045))
+
+        best_phase = y0
+        best_score = -1.0
+        # One pitch contains every possible clamped-scroll phase.
+        for phase in range(y0, min(y1, y0 + pitch)):
+            peaks: list[float] = []
+            expected = phase
+            while expected <= y1:
+                local = expected - y0
+                start = max(0, local - radius)
+                end = min(len(profile), local + radius + 1)
+                if end > start:
+                    peaks.append(float(profile[start:end].max()))
+                expected += pitch
+            if len(peaks) >= 3:
+                # Strong repeated borders matter more than a single header or
+                # footer edge. The median suppresses animated/text outliers.
+                score = float(np.median(peaks)) + 0.2 * float(np.mean(peaks))
+                if score > best_score:
+                    best_score = score
+                    best_phase = phase
+
+        boundaries: list[int] = []
+        expected = best_phase
+        while expected <= y1 + radius:
+            local = expected - y0
+            start = max(0, local - radius)
+            end = min(len(profile), local + radius + 1)
+            if end > start:
+                boundary = y0 + start + int(np.argmax(profile[start:end]))
+                if not boundaries or boundary - boundaries[-1] > pitch * 0.5:
+                    boundaries.append(boundary)
+            expected += pitch
+
+        rows: list[tuple[float, float]] = []
+        for top, bottom in zip(boundaries, boundaries[1:]):
+            span = bottom - top
+            if 0.82 * pitch <= span <= 1.18 * pitch:
+                rows.append((top / height, bottom / height))
+        return rows
+
+    def character_board_calibrated_rows(
+        self,
+        window: Window,
+        png_bytes: bytes,
+    ) -> list[CharacterBoardRow]:
+        """Read level/fatigue only from fixed subregions of complete rows."""
+        regions = self.character_board_row_regions(png_bytes)
+        if not regions:
+            return []
+        # Vision needs surrounding context to recognize isolated glyphs
+        # reliably, so each OCR request includes padding. Values are accepted
+        # only when their final full-window coordinates fall in the narrower
+        # calibrated strips below.
+        padded_left_region = (0.05, 0.15, 0.21, 0.69)
+        padded_fatigue_region = (0.24, 0.15, 0.20, 0.69)
+        level_boxes = self.client.ocr_region(
+            window,
+            padded_left_region,
+            language_correction=False,
+        )
+        fatigue_boxes = self.client.ocr_region(
+            window,
+            padded_fatigue_region,
+            language_correction=False,
+        )
+        try:
+            import cv2
+            import numpy as np
+        except ImportError as error:
+            raise RuntimeError(
+                "OpenCV and NumPy are required for the 在线 marker"
+            ) from error
+        frame = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("Could not decode character-board screenshot")
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        frame_height, frame_width = frame.shape[:2]
+
+        result: list[CharacterBoardRow] = []
+        for top, bottom in regions:
+            height = bottom - top
+
+            def local_position(box: TextBox) -> float:
+                return (1.0 - box.center[1] - top) / height
+
+            levels: list[int] = []
+            for box in level_boxes:
+                if not (
+                    self.CHARACTER_BOARD_LEVEL_STRIP[0]
+                    <= box.center[0]
+                    <= self.CHARACTER_BOARD_LEVEL_STRIP[1]
+                    and 0.30 <= local_position(box) <= 0.96
+                ):
+                    continue
+                match = re.fullmatch(r"[^0-9]*([0-9]{1,3})[^0-9]*", box.normalized)
+                if match and 1 <= int(match.group(1)) <= 100:
+                    levels.append(int(match.group(1)))
+
+            fatigues: list[int] = []
+            for box in fatigue_boxes:
+                if not (
+                    self.CHARACTER_BOARD_FATIGUE_STRIP[0]
+                    <= box.center[0]
+                    <= self.CHARACTER_BOARD_FATIGUE_STRIP[1]
+                    and 0.10 <= local_position(box) <= 0.72
+                ):
+                    continue
+                normalized = box.normalized.upper().replace("O", "0").replace("I", "1")
+                match = re.fullmatch(r"([0-9]{1,3})[/|]100", normalized)
+                if match and 0 <= int(match.group(1)) <= 100:
+                    fatigues.append(int(match.group(1)))
+
+            online_x0 = round(
+                self.CHARACTER_BOARD_ONLINE_STRIP[0] * frame_width
+            )
+            online_x1 = round(
+                self.CHARACTER_BOARD_ONLINE_STRIP[1] * frame_width
+            )
+            online_y0 = round(top * frame_height)
+            online_y1 = round((top + 0.38 * height) * frame_height)
+            marker_crop = hsv[online_y0:online_y1, online_x0:online_x1]
+            green = cv2.inRange(
+                marker_crop,
+                np.array([35, 90, 70], dtype=np.uint8),
+                np.array([90, 255, 255], dtype=np.uint8),
+            )
+            green_ratio = (
+                float((green > 0).mean())
+                if green.size
+                else 0.0
+            )
+            # Calibration samples: online=0.241; every other row <=0.002.
+            online = green_ratio >= 0.08
+            # A focused Vision pass can occasionally emit both 8 and 80 at
+            # nearly the same badge. Prefer the complete larger reading.
+            level = max(levels, default=None)
+            fatigue = fatigues[0] if len(set(fatigues)) == 1 else None
+            result.append(
+                CharacterBoardRow(
+                    top=top,
+                    bottom=bottom,
+                    click_y=1.0 - (top + bottom) / 2,
+                    level=level,
+                    fatigue=fatigue,
+                    online=online,
+                )
+            )
+        return result
 
     def scroll_character_board_to_top(
         self,
@@ -1132,15 +1541,19 @@ class AutoDNF:
             # downward drag, which scrolls the list upward toward its top.
             self.client.drag(
                 window,
-                start=(0.50, 0.72),
-                end=(0.50, 0.34),
+                start=(0.50, 0.35 + self.CHARACTER_BOARD_ROW_PITCH),
+                end=(0.50, 0.35),
                 label="character list upward",
             )
             time.sleep(0.6)
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             after = self.client.capture_png_bytes(window)
-            difference = self.client.region_difference(before, after, (0.12, 0.25, 0.88, 0.82))
+            difference = self.client.region_difference(
+                before,
+                after,
+                self.CHARACTER_BOARD_PANEL,
+            )
             if difference is not None and difference < 2.5:
                 unchanged += 1
                 if unchanged >= 2:
@@ -1149,110 +1562,6 @@ class AutoDNF:
             else:
                 unchanged = 0
         return window, boxes
-
-    @staticmethod
-    def character_board_row_identity(
-        boxes: list[TextBox],
-        row_y: float,
-        level: int,
-        fatigue: int,
-    ) -> str:
-        """Build a stable per-row OCR fingerprint to avoid processing a role twice."""
-        ignored = {"可刷新", "每日1/1", "无法入场", "在线", "昵称/职业/抗魔值"}
-        labels = sorted(
-            box.normalized
-            for box in boxes
-            if 0.13 < box.center[0] < 0.38
-            and abs(box.center[1] - row_y) < 0.09
-            and box.normalized not in ignored
-            and not re.fullmatch(r"[0-9,，/]+", box.normalized)
-        )
-        # The name and profession are normally both included. The fallback is
-        # only used for a transient OCR frame and remains scoped to this row.
-        return "|".join(labels) or f"unreadable:{level}:{fatigue}:{row_y:.3f}"
-
-    @staticmethod
-    def character_board_row_is_online(boxes: list[TextBox], row_y: float) -> bool:
-        """Whether the board's green 在线 marker belongs to this row."""
-        return any(
-            box.normalized == "在线"
-            and box.center[0] < 0.20
-            and abs(box.center[1] - row_y) < 0.09
-            for box in boxes
-        )
-
-    @staticmethod
-    def character_board_fatigue_rows(boxes: list[TextBox]) -> list[tuple[TextBox, int]]:
-        """Return all visible board fatigue labels, irrespective of level OCR."""
-        return [
-            (box, int(match.group(1)))
-            for box in boxes
-            if (match := re.fullmatch(r"([0-9]{1,3})/100", box.normalized))
-            and 0 <= int(match.group(1)) <= 100
-            and 0.18 < box.center[1] < 0.78
-        ]
-
-    @classmethod
-    def character_board_rows(cls, boxes: list[TextBox]) -> list[tuple[int, int, float]]:
-        """Return (fatigue, level, row_y) for readable character-board rows.
-
-        The character level is the standalone number near the lower-left of a
-        row; its nearest fatigue label belongs to the same horizontal card.
-        Requiring both values prevents a fresh low-level alt from being chosen
-        merely because it has 100/100 fatigue.
-        """
-        fatigue_values = cls.character_board_fatigue_rows(boxes)
-        level_values: list[tuple[TextBox, int]] = []
-        for box in boxes:
-            # Level badges are gold numbers with decorative marks beside
-            # them. Vision commonly returns forms such as ``〈80`` or ``<80``
-            # instead of a bare ``80``. Accept one number with decoration
-            # only at its ends, but never a power value such as ``167,262``.
-            match = re.fullmatch(r"[^0-9]*([0-9]{1,3})[^0-9]*", box.normalized)
-            if match is None:
-                continue
-            level = int(match.group(1))
-            if not 1 <= level <= 100:
-                continue
-            # Row level labels are in the left portrait strip. This excludes
-            # fatigue, power and currency values elsewhere on the board.
-            if not (0.06 < box.center[0] < 0.24 and 0.18 < box.center[1] < 0.78):
-                continue
-            level_values.append((box, level))
-        rows: list[tuple[int, int, float]] = []
-        for fatigue_box, fatigue in fatigue_values:
-            # The gold level marker is physically below the fatigue label
-            # (smaller Vision y). Do not use a nearest marker above the label:
-            # that can belong to the previous row and incorrectly promote a
-            # low-level character to level 80.
-            same_row_levels = [
-                item
-                for item in level_values
-                if 0.015 <= fatigue_box.center[1] - item[0].center[1] <= 0.085
-            ]
-            # Full-screen OCR occasionally drops the trailing zero in an
-            # ``80`` level badge and reports ``8``.  The focused badge OCR
-            # performed by the caller may therefore give us two observations
-            # at virtually the same position: 8 and 80.  Keep the closest
-            # group, then prefer the complete (larger) reading within that
-            # group.  This does not promote a neighbouring row because the
-            # group is still constrained by the tight same-row y range above.
-            if not same_row_levels:
-                continue
-            nearest_distance = min(
-                abs(item[0].center[1] - fatigue_box.center[1])
-                for item in same_row_levels
-            )
-            nearest_candidates = [
-                item
-                for item in same_row_levels
-                if abs(item[0].center[1] - fatigue_box.center[1])
-                <= nearest_distance + 0.012
-            ]
-            nearest = max(nearest_candidates, key=lambda item: item[1])
-            level_box, level = nearest
-            rows.append((fatigue, level, fatigue_box.center[1]))
-        return rows
 
     def continue_from_realm_selection(self, battle: bool = False) -> bool:
         self.click_then_wait(

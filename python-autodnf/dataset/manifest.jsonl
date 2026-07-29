@@ -67,3 +67,6 @@
 {"image": "dataset/images/loot_pile_20260726T202645_467020Z.png", "tag": "loot_pile", "captured_at": "2026-07-26T20:26:45.581157+00:00", "window": {"width": 1478.0, "height": 859.0}}
 {"image": "dataset/images/loot_pile_20260726T202652_876911Z.png", "tag": "loot_pile", "captured_at": "2026-07-26T20:26:52.985631+00:00", "window": {"width": 1478.0, "height": 859.0}}
 {"image": "dataset/images/loot_pile_20260726T202701_458780Z.png", "tag": "loot_pile", "captured_at": "2026-07-26T20:27:01.572620+00:00", "window": {"width": 1478.0, "height": 859.0}}
+{"image": "dataset/character_board_calibration/character_board_top_20260729T180609_039986Z.png", "tag": "character_board_top", "captured_at": "2026-07-29T18:06:09.272613+00:00", "window": {"width": 1478.0, "height": 859.0}}
+{"image": "dataset/character_board_calibration/character_board_scrolled_20260729T180707_681877Z.png", "tag": "character_board_scrolled", "captured_at": "2026-07-29T18:07:07.907475+00:00", "window": {"width": 1478.0, "height": 859.0}}
+{"image": "dataset/character_board_calibration/character_board_bottom_20260729T180805_112416Z.png", "tag": "character_board_bottom", "captured_at": "2026-07-29T18:08:05.324812+00:00", "window": {"width": 1478.0, "height": 859.0}}

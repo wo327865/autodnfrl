@@ -212,13 +212,26 @@ class MacClient:
         region: tuple[float, float, float, float] | None = None,
         language_correction: bool = True,
     ) -> list[TextBox]:
+        return self._ocr_image(
+            self.screenshot(window),
+            region,
+            language_correction=language_correction,
+        )
+
+    @staticmethod
+    def _ocr_image(
+        cg_image,
+        region: tuple[float, float, float, float] | None = None,
+        language_correction: bool = True,
+    ) -> list[TextBox]:
+        """Recognize a supplied CGImage; separated for calibration testing."""
         request = VNRecognizeTextRequest.alloc().init()
         request.setRecognitionLevel_(VNRequestTextRecognitionLevelAccurate)
         request.setRecognitionLanguages_(["zh-Hans", "en-US"])
         request.setUsesLanguageCorrection_(language_correction)
         if region is not None:
             request.setRegionOfInterest_(CGRectMake(*region))
-        handler = VNImageRequestHandler.alloc().initWithCGImage_options_(self.screenshot(window), {})
+        handler = VNImageRequestHandler.alloc().initWithCGImage_options_(cg_image, {})
         handler.performRequests_error_([request], None)
         result: list[TextBox] = []
         for observation in request.results() or []:
@@ -227,7 +240,26 @@ class MacClient:
                 continue
             candidate = candidates[0]
             box = observation.boundingBox()
-            result.append(TextBox(str(candidate.string()), box.origin.x, box.origin.y, box.size.width, box.size.height))
+            x, y = box.origin.x, box.origin.y
+            width, height = box.size.width, box.size.height
+            if region is not None:
+                # Vision reports observations relative to its region of
+                # interest. Convert them back into full-image normalized
+                # coordinates so callers can safely combine focused passes.
+                region_x, region_y, region_width, region_height = region
+                x = region_x + x * region_width
+                y = region_y + y * region_height
+                width *= region_width
+                height *= region_height
+            result.append(
+                TextBox(
+                    str(candidate.string()),
+                    x,
+                    y,
+                    width,
+                    height,
+                )
+            )
         return result
 
     def click(self, window: Window, point: tuple[float, float], label: str) -> None:
