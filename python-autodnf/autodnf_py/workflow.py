@@ -86,6 +86,13 @@ class AutoDNF:
     PARTY_PICKER_ROW_PITCH = 0.16
     PARTY_PICKER_ROW_CENTERS = (0.57, 0.41, 0.25)
     PARTY_PICKER_COLUMN_CENTERS = (0.267, 0.511, 0.755)
+    # Top-left-origin regions containing the two companion portraits above
+    # the picker grid. They provide a visual fallback when OCR misses the
+    # 选择完成 marker after a successful card click.
+    PARTY_PICKER_COMPANION_SLOTS = (
+        (0.39, 0.22, 0.47, 0.35),
+        (0.55, 0.22, 0.63, 0.35),
+    )
     # Page-level back arrows (邮箱 / 背包) sit below and right of the app
     # window's outer top-left edge.
     PAGE_BACK_POINT = (0.04, 0.94)
@@ -668,7 +675,7 @@ class AutoDNF:
 
     def wait_for_mail_claim_result(
         self,
-        timeout: float = 20,
+        timeout: float = 30,
     ) -> tuple[str, Window, list[TextBox]]:
         """Wait through claim animation until a foreground result is stable."""
         deadline = time.monotonic() + timeout
@@ -706,6 +713,27 @@ class AutoDNF:
                 if stable_confirm_frames >= 2:
                     print("Mail reward dialog finished rendering")
                     return "mail claim reward", window, boxes
+            elif len(confirmations) == 1:
+                # The confirmation button is generally rendered before (and
+                # recognised more reliably than) the 获得道具 title and action
+                # labels. A stable centered confirmation is sufficient proof
+                # that a foreground mail-result dialog is blocking the page.
+                center = confirmations[0].center
+                if (
+                    previous_confirm is not None
+                    and abs(center[0] - previous_confirm[0]) < 0.015
+                    and abs(center[1] - previous_confirm[1]) < 0.015
+                ):
+                    stable_confirm_frames += 1
+                else:
+                    stable_confirm_frames = 1
+                previous_confirm = center
+                if stable_confirm_frames >= 3:
+                    print(
+                        "Mail confirmation finished rendering "
+                        "(reward title was not OCR-visible)"
+                    )
+                    return "mail claim reward", window, boxes
             else:
                 previous_confirm = None
                 stable_confirm_frames = 0
@@ -731,15 +759,32 @@ class AutoDNF:
                 stable_backpack_full_frames = 0
 
             # Do not let the always-visible background mailbox win while the
-            # foreground dialog is still delayed or partially rendered.
+            # foreground dialog is delayed or partially rendered. Prefer an
+            # explicit empty-mail marker. Some game versions leave a disabled
+            # 领取全部物品 label visible, so its presence is not completion
+            # evidence; without 未收到邮件 we use a deliberately long grace
+            # period before accepting a foreground-free mailbox.
+            explicit_empty = bool(find("未收到邮件", boxes))
             if find("角色邮件", boxes) and not foreground_visible:
                 settled_mailbox_frames += 1
             else:
                 settled_mailbox_frames = 0
             if (
-                time.monotonic() - started >= 8.0
-                and settled_mailbox_frames >= 3
+                (
+                    explicit_empty
+                    and time.monotonic() - started >= 5.0
+                    and settled_mailbox_frames >= 3
+                )
+                or (
+                    time.monotonic() - started >= 18.0
+                    and settled_mailbox_frames >= 5
+                )
             ):
+                if not explicit_empty:
+                    print(
+                        "No mail confirmation appeared during the extended "
+                        "foreground-free settling interval"
+                    )
                 return "no reward", window, boxes
             time.sleep(0.4)
         raise TimeoutError("Timed out waiting for the mail-claim result to finish rendering")
@@ -1738,6 +1783,10 @@ class AutoDNF:
             ((0.60, 0.30), (0.60, 0.30 + self.PARTY_PICKER_ROW_PITCH), 0.88),
         )
         attempted_points: set[tuple[float, float]] = set()
+        # The game fills the left companion portrait before the right one.
+        # Remember already occupied slots so animation in an existing portrait
+        # cannot be mistaken for a newly added second companion.
+        occupied_portrait_slots = set(range(min(companions_selected, 2)))
         announced_card_wait = False
         while companions_selected < 2:
             candidates = [
@@ -1753,15 +1802,32 @@ class AutoDNF:
                 fatigue, point = candidates[0]
                 slot = companions_selected + 1
                 print(f"Selecting visible party companion {slot} with {fatigue}/100 fatigue")
+                before_click = self.client.capture_png_bytes(window)
                 self.client.click(window, point, f"eligible character for companion slot {slot}")
                 attempted_points.add(point)
-                companions_selected += 1
-                time.sleep(0.7)
-                window = self.client.find_window()
-                boxes = self.client.ocr(window)
-                observed = len(find("选择完成", boxes))
-                if observed < companions_selected:
-                    print("Selection marker was not OCR-visible after click; card was fatigue-verified before clicking")
+                (
+                    added,
+                    window,
+                    boxes,
+                    changed_portrait_slot,
+                ) = self.wait_for_party_companion_added(
+                    window,
+                    before_click,
+                    companions_selected,
+                    occupied_portrait_slots,
+                )
+                if added:
+                    companions_selected += 1
+                    if changed_portrait_slot is not None:
+                        occupied_portrait_slots.add(changed_portrait_slot)
+                    print(
+                        f"Verified companion slot {companions_selected} was added"
+                    )
+                else:
+                    print(
+                        "Card click produced no selection change; ignoring "
+                        "that card and continuing the search"
+                    )
                 continue
 
             locked_tail = find("前置任务", boxes)
@@ -1862,6 +1928,79 @@ class AutoDNF:
             # the old page must not block the new page's top-left card.
             attempted_points.clear()
         return self.save_party_formation(window, boxes, companions_selected)
+
+    def wait_for_party_companion_added(
+        self,
+        window: Window,
+        before_click: bytes,
+        previous_count: int,
+        occupied_portrait_slots: set[int],
+        timeout: float = 4.0,
+    ) -> tuple[bool, Window, list[TextBox], int | None]:
+        """Confirm that a picker click really added one companion.
+
+        OCR marker growth is the primary signal. A persistent change in a
+        previously empty top portrait slot is the fallback. Merely clicking a
+        fatigue-looking card never advances the selected count.
+        """
+        deadline = time.monotonic() + timeout
+        visual_slot: int | None = None
+        stable_visual_frames = 0
+        last_window = window
+        last_boxes: list[TextBox] = []
+        while time.monotonic() < deadline:
+            time.sleep(0.35)
+            last_window = self.client.find_window()
+            last_boxes = self.client.ocr(last_window)
+            observed = len(find("选择完成", last_boxes))
+            if observed > previous_count:
+                after = self.client.capture_png_bytes(last_window)
+                changes = [
+                    self.client.region_difference(before_click, after, region)
+                    for region in self.PARTY_PICKER_COMPANION_SLOTS
+                ]
+                available = [
+                    (change, index)
+                    for index, change in enumerate(changes)
+                    if index not in occupied_portrait_slots
+                    and change is not None
+                ]
+                changed = max(available, default=(None, None))[1]
+                return True, last_window, last_boxes, changed
+
+            after = self.client.capture_png_bytes(last_window)
+            changes = [
+                self.client.region_difference(before_click, after, region)
+                for region in self.PARTY_PICKER_COMPANION_SLOTS
+            ]
+            available = [
+                (change, index)
+                for index, change in enumerate(changes)
+                if index not in occupied_portrait_slots
+                and change is not None
+            ]
+            strongest_change, strongest_slot = max(
+                available,
+                default=(None, None),
+            )
+            if strongest_change is not None and strongest_change >= 8.0:
+                if strongest_slot == visual_slot:
+                    stable_visual_frames += 1
+                else:
+                    visual_slot = strongest_slot
+                    stable_visual_frames = 1
+                if stable_visual_frames >= 2:
+                    if self.debug:
+                        print(
+                            "Selection marker was not OCR-visible; verified "
+                            f"new top portrait visually (difference "
+                            f"{strongest_change:.2f})"
+                        )
+                    return True, last_window, last_boxes, visual_slot
+            else:
+                visual_slot = None
+                stable_visual_frames = 0
+        return False, last_window, last_boxes, None
 
     def save_party_formation(
         self,
