@@ -126,6 +126,32 @@ class AutoDNF:
         _, window, boxes = self.wait_for_any({state: texts}, timeout)
         return window, boxes
 
+    def wait_for_character_selection_board(
+        self,
+        timeout: float = 18,
+    ) -> tuple[Window, list[TextBox]]:
+        """Recognise the character board even when its title is obscured.
+
+        Login announcements can temporarily cover 挑战进度 while leaving the
+        table columns, repeated row fields, and bottom controls visible. Each
+        alternative below requires multiple board-specific anchors so a town
+        screen cannot satisfy the check through one incidental OCR match.
+        """
+        _, window, boxes = self.wait_for_any(
+            {
+                "character selection board header": ["挑战进度"],
+                "character selection board columns": ["疲劳值", "神秘商店"],
+                "character selection board rows": ["可刷新", "每日1/1"],
+                "character selection board controls": [
+                    "玩法设置",
+                    "选择角色",
+                    "开始游戏",
+                ],
+            },
+            timeout,
+        )
+        return window, boxes
+
     def wait_for_any(
         self,
         states: dict[str, list[str]],
@@ -1117,18 +1143,23 @@ class AutoDNF:
                 f"character selection ({attempt}/3)",
             )
             try:
-                # 挑战进度 is the board's persistent header. 开始游戏 can be
-                # greyed out or missed by OCR until a row is selected, so it
-                # must not be required to recognise a successfully opened
-                # character-selection board.
-                window, boxes = self.wait_for(
-                    ["挑战进度"],
-                    "character selection board",
-                    timeout=12,
-                )
+                window, boxes = self.wait_for_character_selection_board(timeout=12)
+                print("Character selection board is ready")
                 break
             except TimeoutError:
-                window, boxes = self.wait_for(["委托", "选角"], "town character controls", timeout=8)
+                # The click may have been intercepted. Only retry after town
+                # controls are positively visible; if a late board render
+                # appears, recognise it before making another click.
+                try:
+                    window, boxes = self.wait_for_character_selection_board(timeout=3)
+                    print("Character selection board finished rendering")
+                    break
+                except TimeoutError:
+                    window, boxes = self.wait_for(
+                        ["委托", "选角"],
+                        "town character controls",
+                        timeout=8,
+                    )
                 print(f"Character selection did not open; retrying ({attempt}/3)")
         else:
             print("Character selection did not open after three safe recovery attempts")
