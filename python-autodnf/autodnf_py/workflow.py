@@ -1771,7 +1771,11 @@ class AutoDNF:
         # drag its card list upward to inspect the next page; never assume all
         # possible companions fit in the initial three rows.
         companions_selected = len(find("选择完成", boxes))
-        card_deadline = time.monotonic() + 12
+        # Numeric fatigue OCR is useful for choosing a card, but explicit
+        # unavailable labels are also proof that the grid has finished
+        # rendering. Keep the initial grace period short so an obviously
+        # exhausted page scrolls promptly.
+        card_deadline = time.monotonic() + 4
         scrolls = 0
         unchanged_scrolls = 0
         # PlayCover occasionally drops a drag that starts over an animated
@@ -1857,7 +1861,12 @@ class AutoDNF:
                 and 0.14 < box.center[0] < 0.88
                 and 0.15 < box.center[1] < 0.72
             ]
-            if len(numeric_values) < 3 and time.monotonic() < card_deadline:
+            visibly_unavailable = len(locked_tail) + len(fatigue_empty)
+            if (
+                len(numeric_values) < 3
+                and visibly_unavailable < 3
+                and time.monotonic() < card_deadline
+            ):
                 if not announced_card_wait:
                     print("Character cards are still rendering; waiting for readable fatigue values")
                     announced_card_wait = True
@@ -2076,6 +2085,7 @@ class AutoDNF:
                     self.click_right_button("确认", window, boxes, "entry material confirmation")
         deadline = time.monotonic() + 60 * 60
         town_frames = 0
+        town_exit_expected = False
         while time.monotonic() < deadline:
             window = self.client.find_window()
             boxes = self.client.ocr(window)
@@ -2099,12 +2109,17 @@ class AutoDNF:
             # 结算 is sufficient—do this before every reward/dungeon branch so
             # the background 领奖结算 can never trigger another loot sweep.
             if exact("结算", boxes):
+                town_exit_expected = True
                 self.click_from_boxes("结算", window, boxes, "final settlement")
                 time.sleep(2)
                 continue
             if find("使用角色金库", boxes):
                 self.click_right_button("确认", window, boxes, "entry material confirmation")
                 time.sleep(2)
+                continue
+            if self.confirm_dungeon_next_challenge(window, boxes):
+                town_frames = 0
+                time.sleep(1.2)
                 continue
             # No 再次挑战 means the fatigue limit has been reached. This must
             # be handled before the generic in-dungeon movement rule, because
@@ -2115,17 +2130,28 @@ class AutoDNF:
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
                 self.click_right_button("领奖结算", window, boxes, "settlement exit")
+                town_exit_expected = True
                 time.sleep(2)
                 continue
             if find("再次挑战", boxes) and find("领奖结算", boxes):
                 self.collect_visible_rewards()
-                self.retry_or_exit()
+                town_exit_expected = self.retry_or_exit()
                 continue
             # After final settlement the exhausted party remains inside the
             # dungeon and still shows multiple /100 HUD labels. An exact
             # right-side 返回城镇 button is therefore stronger evidence than
             # the generic in-dungeon HUD and should be acted on immediately.
-            if exact("返回城镇", boxes) and not exact("委托", boxes):
+            dungeon_fatigues = [
+                int(match.group(1))
+                for box in boxes
+                if (match := re.fullmatch(r"([0-9]{1,3})/100", box.normalized))
+            ]
+            exhausted_hud = bool(dungeon_fatigues) and max(dungeon_fatigues) < 10
+            if (
+                (town_exit_expected or exhausted_hud)
+                and exact("返回城镇", boxes)
+                and not exact("委托", boxes)
+            ):
                 self.click_right_button("返回城镇", window, boxes, "return to town")
                 self.wait_for(
                     ["委托", "选角"],
@@ -2146,7 +2172,11 @@ class AutoDNF:
                 or bool(find("秘境：", boxes))
                 or len(find("/100", boxes)) >= 2
             )
-            town_control = bool(exact("委托", boxes))
+            # Both controls belong to the town HUD. Requiring the pair avoids
+            # accepting a dungeon notification that happens to contain 委托.
+            town_control = bool(exact("委托", boxes)) and bool(
+                exact("选角", boxes)
+            )
             if town_control and not dungeon_evidence:
                 town_frames += 1
                 if town_frames >= 2:
@@ -2175,6 +2205,47 @@ class AutoDNF:
         )
         if state == "entry material confirmation":
             self.click_right_button("确认", window, boxes, "entry material confirmation")
+
+    def confirm_dungeon_next_challenge(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Accept only a locally identified next-room/challenge prompt."""
+        has_next = bool(find("下一", boxes)) or bool(find("下个", boxes))
+        has_progress_action = any(
+            find(text, boxes)
+            for text in ("开始挑战", "继续挑战", "进入", "区域", "房间")
+        )
+        explicit_challenge = bool(find("开始挑战", boxes)) or bool(
+            find("继续挑战", boxes)
+        )
+        # A portal prompt can use 再次挑战 as its action wording. The
+        # result screen uses the same label, but also always exposes 领奖结算;
+        # excluding that pair prevents this handler from stealing the normal
+        # boss-result action.
+        explicit_challenge = explicit_challenge or (
+            bool(find("再次挑战", boxes))
+            and not bool(find("领奖结算", boxes))
+        )
+        if not (explicit_challenge or (has_next and has_progress_action)):
+            return False
+        choices = [
+            box
+            for box in exact("确认", boxes)
+            if 0.45 < box.center[0] < 0.82
+            and 0.12 < box.center[1] < 0.55
+        ]
+        if len(choices) != 1:
+            if self.debug:
+                print(
+                    "Detected a next-challenge prompt but could not isolate "
+                    f"one safe 确认 button (found {len(choices)})"
+                )
+            return False
+        print("Detected next-room challenge confirmation; clicking 确认")
+        self.client.click(window, choices[0].center, "confirm next dungeon challenge")
+        return True
 
     def collect_visible_rewards(self) -> None:
         """Find a pile with the model/OCR, loosely center it, then sweep."""
@@ -2214,9 +2285,46 @@ class AutoDNF:
             # Do not move blindly after the full model/OCR map search.
             center = (0.58, 0.43)
             print("No model/OCR pile detected; sweeping central world area without moving")
-        # One slow, wide spiral is more reliable than two fast passes: it
-        # avoids releasing the collection drag between adjacent rewards.
+        # A pile below this line overlaps the action/skill bar. Move the
+        # character downward first so the world pile shifts into a safe part
+        # of the screen instead of starting a drag on a skill button.
+        if center[1] < 0.30:
+            print(
+                f"Reward pile is low on screen (y={center[1]:.2f}); "
+                "moving down before collection"
+            )
+            self.client.hold([125], 0.35)  # down arrow
+            time.sleep(0.55)
+            moved = self.wait_for_reward_pile(timeout=1.6)
+            if moved is not None:
+                center = moved
+            else:
+                center = (center[0], 0.31)
+            window = self.client.find_window()
+
+        # One slow, wide spiral is the normal pass. If a detected pile remains
+        # afterward, nudge down and retry once; this specifically recovers
+        # drops that were partially hidden by the lower skill controls.
         self.client.spiral_drag(window, center, radius=0.28, turns=4.5)
+        time.sleep(0.55)
+        remaining = self.wait_for_reward_pile(timeout=1.6)
+        if remaining is not None:
+            print(
+                "Reward pile remains after collection; moving down slightly "
+                "and retrying once"
+            )
+            self.client.hold([125], 0.30)  # down arrow
+            time.sleep(0.55)
+            retry_center = self.wait_for_reward_pile(timeout=1.6)
+            if retry_center is None:
+                retry_center = (remaining[0], max(remaining[1], 0.31))
+            window = self.client.find_window()
+            self.client.spiral_drag(
+                window,
+                retry_center,
+                radius=0.24,
+                turns=4.0,
+            )
 
     def wait_for_reward_pile(self, timeout: float) -> tuple[float, float] | None:
         """Require a second pile observation after a short drop-settling delay."""
@@ -2314,20 +2422,26 @@ class AutoDNF:
         middle = len(pile) // 2
         return xs[middle], ys[middle]
 
-    def retry_or_exit(self) -> None:
+    def retry_or_exit(self) -> bool:
+        """Retry the dungeon, returning True only when settlement was chosen."""
         for attempt in range(1, 4):
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             self.click_right_button("再次挑战", window, boxes, f"retry ({attempt}/3)")
             try:
-                self.wait_for_any(
+                state, window, boxes = self.wait_for_any(
                     {
                         "next dungeon": ["秘境："],
                         "entry material confirmation": ["使用角色金库"],
+                        "next challenge confirmation": ["再次挑战", "确认"],
+                        "start challenge confirmation": ["开始挑战", "确认"],
                     },
                     timeout=7,
                 )
-                return
+                if state.endswith("challenge confirmation"):
+                    if self.confirm_dungeon_next_challenge(window, boxes):
+                        time.sleep(1.2)
+                return False
             except TimeoutError:
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
@@ -2338,7 +2452,7 @@ class AutoDNF:
                 ]
                 if fatigue and min(fatigue) < 10:
                     self.click_right_button("领奖结算", window, boxes, "settlement exit")
-                    return
+                    return True
                 print("Retry did not transition; sweeping boss rewards again")
                 self.collect_visible_rewards()
         raise RuntimeError("Items still remain after three reward-collection sweeps")
