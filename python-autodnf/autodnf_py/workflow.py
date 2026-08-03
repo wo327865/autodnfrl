@@ -650,24 +650,58 @@ class AutoDNF:
         else:
             claim = exact("领取全部物品", boxes)
             if len(claim) == 1:
-                self.client.click(window, claim[0].center, "claim all mail items")
-                state, window, boxes = self.wait_for_mail_claim_result()
-                if state == "backpack full":
-                    print("Detected 背包已满 while claiming mail; leaving this character untouched")
-                    skip_character = True
-                elif state == "mail claim reward":
-                    self.click_topmost_right_confirmation(
+                claim_point = claim[0].center
+                for claim_attempt in range(1, 3):
+                    self.client.click(
                         window,
-                        boxes,
-                        "confirm mail claim",
+                        claim_point,
+                        f"claim all mail items ({claim_attempt}/2)",
                     )
-                    self.wait_for_settled_mailbox_after_claim()
-                    print("Claimed all character mail")
-                else:
+                    state, window, boxes = self.wait_for_mail_claim_result()
+                    if state == "backpack full":
+                        print(
+                            "Detected 背包已满 while claiming mail; "
+                            "leaving this character untouched"
+                        )
+                        skip_character = True
+                        break
+                    if state == "mail claim reward":
+                        self.click_topmost_right_confirmation(
+                            window,
+                            boxes,
+                            "confirm mail claim",
+                        )
+                        self.wait_for_settled_mailbox_after_claim()
+                        print("Claimed all character mail")
+                        break
+
+                    # No foreground result appeared. If the mailbox is still
+                    # present and not explicitly empty, the network may have
+                    # dropped the click. Retry exactly once, refreshing the
+                    # button coordinate when OCR can still read it.
+                    refreshed_claim = exact("领取全部物品", boxes)
+                    if len(refreshed_claim) == 1:
+                        claim_point = refreshed_claim[0].center
+                    if (
+                        claim_attempt == 1
+                        and find("角色邮件", boxes)
+                        and not find("未收到邮件", boxes)
+                    ):
+                        print(
+                            "Claim-all produced no effect and the mailbox is "
+                            "still unchanged; retrying once"
+                        )
+                        time.sleep(0.6)
+                        continue
+
                     # A disabled claim button can remain OCR-visible when the
-                    # mailbox has no attachments. It is considered empty only
-                    # after a long foreground-free settling interval.
-                    print("Mail claim did not open a reward dialog; treating mailbox as empty")
+                    # mailbox has no attachments. After the one permitted
+                    # retry, a settled foreground-free mailbox is empty.
+                    print(
+                        "Mail claim did not open a reward dialog after the "
+                        "allowed attempt(s); treating mailbox as empty"
+                    )
+                    break
             else:
                 print("No enabled claim-all mail button was detected")
         self.return_to_town_from_page("邮箱", "mailbox")
@@ -1792,6 +1826,7 @@ class AutoDNF:
         # cannot be mistaken for a newly added second companion.
         occupied_portrait_slots = set(range(min(companions_selected, 2)))
         announced_card_wait = False
+        focused_view_attempted = False
         while companions_selected < 2:
             candidates = [
                 candidate
@@ -1802,6 +1837,35 @@ class AutoDNF:
                 )
                 if candidate[1] not in attempted_points
             ]
+            if not candidates and not focused_view_attempted:
+                # Full-screen OCR occasionally returns a clearly visible 100
+                # as 1OO/I00 or joins it to the potion icon. Retry only the
+                # fixed grid, with language correction disabled, before
+                # deciding this view has no usable card. Keep only numeric
+                # observations so selected/blocking labels are not duplicated.
+                focused_view_attempted = True
+                focused = self.client.ocr_region(
+                    window,
+                    (0.14, 0.18, 0.74, 0.49),
+                    language_correction=False,
+                )
+                focused_numbers = [
+                    box
+                    for box in focused
+                    if self.party_picker_numeric_value(box) is not None
+                ]
+                if focused_numbers:
+                    candidates = [
+                        candidate
+                        for candidate in self.eligible_cards(
+                            [*boxes, *focused_numbers],
+                            target_fatigue=current_fatigue,
+                            emit_debug=False,
+                        )
+                        if candidate[1] not in attempted_points
+                    ]
+                    if candidates and self.debug:
+                        print("Focused picker OCR recovered an eligible card")
             if candidates:
                 fatigue, point = candidates[0]
                 slot = companions_selected + 1
@@ -1822,6 +1886,7 @@ class AutoDNF:
                 )
                 if added:
                     companions_selected += 1
+                    focused_view_attempted = False
                     if changed_portrait_slot is not None:
                         occupied_portrait_slots.add(changed_portrait_slot)
                     print(
@@ -1857,7 +1922,7 @@ class AutoDNF:
             numeric_values = [
                 box
                 for box in boxes
-                if re.fullmatch(r"[0-9]{1,3}", box.normalized)
+                if self.party_picker_numeric_value(box) is not None
                 and 0.14 < box.center[0] < 0.88
                 and 0.15 < box.center[1] < 0.72
             ]
@@ -1936,6 +2001,7 @@ class AutoDNF:
             # Coordinates are reused after a list scroll, so candidates from
             # the old page must not block the new page's top-left card.
             attempted_points.clear()
+            focused_view_attempted = False
         return self.save_party_formation(window, boxes, companions_selected)
 
     def wait_for_party_companion_added(
@@ -2256,15 +2322,16 @@ class AutoDNF:
             window = self.client.find_window()
             center = self.wait_for_reward_pile(timeout=2.4)
         if center is not None:
-            # The spiral covers some surrounding area, but the pile still
-            # needs to be reasonably central. Allow up to four useful moves
-            # while never chasing it back across the screen after an overshoot.
+            # The spiral covers a wide surrounding area. A pile within one
+            # quarter of the screen width from the vertical centre line needs
+            # no horizontal correction. For farther piles, allow up to four
+            # useful moves while never chasing back after an overshoot.
             previous_direction: int | None = None
             previous_distance = abs(center[0] - 0.5)
             for _ in range(4):
-                if 0.38 <= center[0] <= 0.62:
+                if abs(center[0] - 0.5) <= 0.25:
                     break
-                direction = 124 if center[0] > 0.57 else 123  # right / left arrow
+                direction = 124 if center[0] > 0.5 else 123  # right / left arrow
                 if previous_direction is not None and direction != previous_direction:
                     print("Pile crossed the centre after repositioning; stopping correction")
                     break
@@ -2349,11 +2416,21 @@ class AutoDNF:
         detection = self.loot_detector.detect(self.client, window)
         if detection is not None:
             center = detection.center
-            print(
-                f"Model detected loot pile at ({center[0]:.2f}, {center[1]:.2f}), "
-                f"confidence {detection.confidence:.2f}"
-            )
-            return center
+            # Defence in depth: keep the action decision constrained even if
+            # detector-side filtering changes later. The upper screen lane is
+            # reserved for temporary 获得[...] notifications and can never be
+            # a valid ground-collection target.
+            if 0.12 < center[0] < 0.92 and 0.18 < center[1] < 0.70:
+                print(
+                    f"Model detected loot pile at ({center[0]:.2f}, {center[1]:.2f}), "
+                    f"confidence {detection.confidence:.2f}"
+                )
+                return center
+            if self.debug:
+                print(
+                    "Ignoring model loot detection outside the playable "
+                    f"drop band at ({center[0]:.2f}, {center[1]:.2f})"
+                )
         return self.reward_pile_center(self.client.ocr(window))
 
     def explore_for_rewards(self) -> None:
@@ -2402,7 +2479,7 @@ class AutoDNF:
             box for box in boxes
             # Gameplay-only region: excludes the top menus, right result
             # buttons, party panel, and the lower skill bar.
-            if 0.16 < box.center[0] < 0.91 and 0.20 < box.center[1] < 0.76
+            if 0.16 < box.center[0] < 0.91 and 0.20 < box.center[1] < 0.70
             and any(marker in box.normalized for marker in reward_markers)
         ]
         if not labels:
@@ -2482,11 +2559,12 @@ class AutoDNF:
 
         fatigue: list[tuple[TextBox, int]] = []
         for box in boxes:
-            match = re.fullmatch(r"[0-9]{1,3}", box.normalized)
-            if match and 0 <= int(match.group(0)) <= 100:
-                fatigue.append((box, int(match.group(0))))
+            value = self.party_picker_numeric_value(box)
+            if value is not None:
+                fatigue.append((box, value))
         selected = find("选择完成", boxes)
         fatigue_blocked = find("疲劳值不足", boxes)
+        progression_blocked = find("前置任务", boxes)
 
         # The picker itself is a fixed three-column grid. OCR establishes only
         # whether a cell is selected or has usable fatigue; it does not define
@@ -2505,7 +2583,7 @@ class AutoDNF:
                 is_blocked = any(
                     column(item.center[0]) == card_column
                     and row(item.center[1]) == row_index
-                    for item in fatigue_blocked
+                    for item in [*fatigue_blocked, *progression_blocked]
                 )
                 fatigue_values = [
                     value
@@ -2548,6 +2626,23 @@ class AutoDNF:
                     f"(normalized {point[0]:.3f}, {point[1]:.3f})"
                 )
         return candidates
+
+    @staticmethod
+    def party_picker_numeric_value(box: TextBox) -> int | None:
+        """Parse a short picker number despite common Vision OCR confusions."""
+        normalized = (
+            box.normalized.upper()
+            .replace("O", "0")
+            .replace("Q", "0")
+            .replace("I", "1")
+            .replace("L", "1")
+            .replace("|", "1")
+        )
+        match = re.fullmatch(r"[^0-9]*([0-9]{1,3})[^0-9]*", normalized)
+        if match is None:
+            return None
+        value = int(match.group(1))
+        return value if 0 <= value <= 100 else None
 
     @staticmethod
     def card_sort_key(

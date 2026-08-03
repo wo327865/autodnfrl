@@ -92,12 +92,13 @@ class LootPileDetector:
         detections: list[LootPileDetection],
     ) -> LootPileDetection | None:
         # The playable loot-label band excludes the top menus and lower skill
-        # bar/window border. This rejects the two bottom-edge false positives
-        # observed in local holdout validation while retaining edge piles.
+        # bar/window border. Item-acquired notifications descend from the top
+        # and can reach about y=0.76 in Vision coordinates, so the upper bound
+        # must remain below that notification lane.
         candidates = [
             detection
             for detection in detections
-            if 0.18 < detection.center[1] < 0.78
+            if 0.18 < detection.center[1] < 0.70
         ]
         return max(candidates, key=lambda detection: detection.confidence, default=None)
 
