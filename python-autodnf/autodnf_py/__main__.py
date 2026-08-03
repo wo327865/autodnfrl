@@ -9,14 +9,14 @@ from pathlib import Path
 from .macos import GlobalStopShortcut, MacClient
 from .template_matcher import FixedTemplateMatcher
 from .vision_fallback import GeminiVisionFallback, VisionFallbackError
-from .workflow import AutoDNF
+from .workflow import AutoDNF, exact, find
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="DNF PlayCover automation")
     parser.add_argument(
         "command",
-        choices=["scan", "capture", "run", "realm", "party", "battle", "maintenance"],
+        choices=["scan", "capture", "run", "realm", "party", "battle", "maintenance", "autoclick"],
     )
     parser.add_argument("--execute", action="store_true", help="allow clicks and key presses")
     parser.add_argument("--battle", action="store_true", help="continue into the dungeon after party formation")
@@ -34,6 +34,12 @@ def main() -> None:
     parser.add_argument("--window", default="地下城与勇士")
     parser.add_argument("--count", type=int, default=1, help="frames to save with the capture command")
     parser.add_argument("--interval", type=float, default=1.0, help="seconds between captured frames")
+    parser.add_argument(
+        "--click-interval",
+        type=float,
+        default=5.0,
+        help="seconds between autoclick attempts (default: 5)",
+    )
     parser.add_argument("--tag", default="frame", help="scenario tag used in captured frame names")
     parser.add_argument("--output", default="dataset/images", help="directory for captured detector-training images")
     parser.add_argument(
@@ -121,6 +127,20 @@ def main() -> None:
                 flow.run_battle(start_by_entering=True)
         elif args.command == "maintenance":
             flow.run_mail_maintenance_all()
+        elif args.command == "autoclick":
+            interval = max(0.2, args.click_interval)
+            print(f"Clicking exact 启动转盘 every {interval:g} seconds. Press Control+T to stop.")
+            while True:
+                window = client.find_window()
+                boxes = client.ocr(window)
+                buttons = exact("启动转盘", boxes) or find("启动转盘", boxes)
+                if len(buttons) == 1:
+                    client.click(window, buttons[0].center, "启动转盘")
+                elif not buttons:
+                    print("启动转盘 is not currently visible; waiting")
+                else:
+                    print(f"Found {len(buttons)} 启动转盘 candidates; not clicking ambiguously")
+                time.sleep(interval)
         else:
             flow.run_battle(start_by_entering=False)
     except KeyboardInterrupt:

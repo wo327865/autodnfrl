@@ -2131,11 +2131,10 @@ class AutoDNF:
                 f"No further eligible companion found; entering with "
                 f"{companions_selected} selected companion(s)"
             )
-        complete = exact("编队完成", boxes)
-        if len(complete) != 1:
-            raise RuntimeError("Could not identify formation-complete button")
         for attempt in range(1, 4):
-            self.client.click(window, complete[0].center, f"编队完成 ({attempt}/3)")
+            if not self.click_fresh_party_complete(f"编队完成 ({attempt}/3)"):
+                time.sleep(0.6)
+                continue
             time.sleep(0.8)
             # Vision occasionally misses the bright picker title for one
             # frame. Require two consecutive frames without it before
@@ -2155,10 +2154,27 @@ class AutoDNF:
                 print("Party formation saved")
                 return True
             print(f"编队完成 did not close the picker; retrying ({attempt}/3)")
-            complete = exact("编队完成", boxes)
-            if len(complete) != 1:
-                break
         raise RuntimeError("Party picker did not close after 编队完成")
+
+    def click_fresh_party_complete(self, label: str) -> bool:
+        """Locate 编队完成 in the latest picker frame before clicking it."""
+        window = self.client.find_window()
+        boxes = self.client.ocr(window)
+        choices = [
+            box
+            for box in exact("编队完成", boxes)
+            if 0.35 < box.center[0] < 0.65 and 0.08 < box.center[1] < 0.28
+        ]
+        if len(choices) != 1:
+            if self.debug:
+                print(f"Fresh OCR found {len(choices)} 编队完成 button(s)")
+            return False
+        button = choices[0]
+        # The OCR label is a little above the visual button centre. Vision's
+        # bottom-left coordinate system means reducing y moves physically down.
+        point = (button.center[0], max(0.02, button.center[1] - 0.018))
+        self.client.click(window, point, label)
+        return True
 
     def run_battle(self, start_by_entering: bool = False) -> None:
         """Conservative dungeon loop; companion characters perform combat."""
@@ -2179,7 +2195,7 @@ class AutoDNF:
                     timeout=20,
                 )
                 if find("使用角色金库", boxes):
-                    self.click_right_button("确认", window, boxes, "entry material confirmation")
+                    self.click_entry_material_confirmation(window, boxes, "entry material confirmation")
                     time.sleep(1.2)
         deadline = time.monotonic() + 60 * 60
         town_frames = 0
@@ -2318,7 +2334,7 @@ class AutoDNF:
             timeout=20,
         )
         if state == "entry material confirmation":
-            self.click_right_button("确认", window, boxes, "entry material confirmation")
+            self.click_entry_material_confirmation(window, boxes, "entry material confirmation")
             time.sleep(1.2)
 
     def cancel_unexpected_dungeon_entry_confirmation(
@@ -2377,9 +2393,14 @@ class AutoDNF:
         )
         if not (explicit_challenge or (has_next and has_progress_action)):
             return False
+        # Re-read immediately before the click: the challenge popup slides in
+        # and a previously captured OCR box can be visibly above its final
+        # button position.
+        fresh_window = self.client.find_window()
+        fresh_boxes = self.client.ocr(fresh_window)
         choices = [
             box
-            for box in exact("确认", boxes)
+            for box in exact("确认", fresh_boxes)
             if 0.45 < box.center[0] < 0.82
             and 0.12 < box.center[1] < 0.55
         ]
@@ -2391,7 +2412,9 @@ class AutoDNF:
                 )
             return False
         print("Detected next-room challenge confirmation; clicking 确认")
-        self.client.click(window, choices[0].center, "confirm next dungeon challenge")
+        button = choices[0]
+        point = (button.center[0], max(0.02, button.center[1] - 0.018))
+        self.client.click(fresh_window, point, "confirm next dungeon challenge")
         return True
 
     def collect_visible_rewards(self) -> None:
@@ -2604,8 +2627,7 @@ class AutoDNF:
                     timeout=7,
                 )
                 if state == "entry material confirmation":
-                    self.click_right_button(
-                        "确认",
+                    self.click_entry_material_confirmation(
                         window,
                         boxes,
                         "retry entry material confirmation",
@@ -2659,6 +2681,22 @@ class AutoDNF:
         if len(choices) != 1:
             raise RuntimeError(f"Could not identify exact right-side {text!r} button")
         self.client.click(window, choices[0].center, label)
+
+    def click_entry_material_confirmation(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+        label: str,
+    ) -> None:
+        """Click the upper half of the entry-material confirmation button."""
+        choices = [box for box in exact("确认", boxes) if box.center[0] > 0.5]
+        if len(choices) != 1:
+            raise RuntimeError("Could not identify exact entry-material confirmation button")
+        box = choices[0]
+        # Text OCR lands slightly low within this tall button. Vision uses a
+        # bottom-left origin, so increasing y moves the click physically up.
+        point = (box.center[0], min(0.98, box.center[1] + 0.025))
+        self.client.click(window, point, label)
 
     def eligible_cards(
         self,
