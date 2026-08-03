@@ -43,6 +43,15 @@ class AutoDNF:
     # never happens for an arbitrary unrecognised overlay.
     ACTIVITY_POPUP_TEXTS = ("活动角色福利", "前往指定活动角色")
     ACTIVITY_POPUP_CLOSE = (0.94, 0.85)
+    # PlayCover's keyboard-control tutorial can appear after logging into
+    # town. Its artwork/pages vary, but these title labels and the title-bar X
+    # are stable.
+    KEYBOARD_GUIDE_POPUP_TEXTS = ("键盘模式指南", "角色操作")
+    KEYBOARD_GUIDE_POPUP_CLOSE = (0.81, 0.87)
+    # Bottom-left-origin normalized centre of 取消 in the uniquely titled
+    # dungeon material-source dialog. This is used only when the dialog title
+    # is visible but OCR misses the button itself.
+    DUNGEON_ENTRY_CANCEL = (0.43, 0.22)
     # This harmless informational dialog can appear shortly after switching
     # characters. Gate the generic 确认 button behind unique guild-sign-in text
     # so an unrelated confirmation can never be accepted automatically.
@@ -209,6 +218,9 @@ class AutoDNF:
             # action. Dismiss it immediately rather than waiting for the
             # current state timeout and sending an unnecessary cloud request.
             if self.dismiss_known_activity_popup(window, boxes):
+                delay = 0.4
+                continue
+            if self.dismiss_known_keyboard_guide_popup(window, boxes):
                 delay = 0.4
                 continue
             for state, texts in states.items():
@@ -412,6 +424,25 @@ class AutoDNF:
             return False
         print("Detected known activity popup; clicking its close X")
         self.client.click(window, self.ACTIVITY_POPUP_CLOSE, "close activity popup")
+        time.sleep(0.8)
+        return True
+
+    def dismiss_known_keyboard_guide_popup(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Close the uniquely identified keyboard tutorial in town."""
+        if self.in_dungeon or not self.client.execute:
+            return False
+        if not all(find(text, boxes) for text in self.KEYBOARD_GUIDE_POPUP_TEXTS):
+            return False
+        print("Detected keyboard-mode guide; clicking its close X")
+        self.client.click(
+            window,
+            self.KEYBOARD_GUIDE_POPUP_CLOSE,
+            "close keyboard-mode guide",
+        )
         time.sleep(0.8)
         return True
 
@@ -2149,8 +2180,10 @@ class AutoDNF:
                 )
                 if find("使用角色金库", boxes):
                     self.click_right_button("确认", window, boxes, "entry material confirmation")
+                    time.sleep(1.2)
         deadline = time.monotonic() + 60 * 60
         town_frames = 0
+        no_retry_frames = 0
         town_exit_expected = False
         while time.monotonic() < deadline:
             window = self.client.find_window()
@@ -2180,8 +2213,13 @@ class AutoDNF:
                 time.sleep(2)
                 continue
             if find("使用角色金库", boxes):
-                self.click_right_button("确认", window, boxes, "entry material confirmation")
-                time.sleep(2)
+                # Intentional entry confirmations are handled synchronously
+                # by enter_dungeon/retry_or_exit. Seeing this dialog here means
+                # movement or a loot sweep touched the orange portal while the
+                # boss-result screen was active. Cancel it so the normal
+                # 再次挑战 action remains available.
+                if self.cancel_unexpected_dungeon_entry_confirmation(window, boxes):
+                    time.sleep(0.8)
                 continue
             if self.confirm_dungeon_next_challenge(window, boxes):
                 town_frames = 0
@@ -2189,8 +2227,16 @@ class AutoDNF:
                 continue
             # No 再次挑战 means the fatigue limit has been reached. This must
             # be handled before the generic in-dungeon movement rule, because
-            # the result scene still contains 0/100 party HUD labels.
+            # the result scene still contains 0/100 party HUD labels. Require
+            # two consecutive frames: a transient OCR miss of 再次挑战 must not
+            # send a still-usable active character back to town.
             if find("领奖结算", boxes) and not find("再次挑战", boxes):
+                no_retry_frames += 1
+                if no_retry_frames < 2:
+                    if self.debug:
+                        print("Retry button absent for one frame; verifying result state")
+                    time.sleep(0.6)
+                    continue
                 print("No retry available; collecting final rewards and settling")
                 self.collect_visible_rewards()
                 window = self.client.find_window()
@@ -2200,9 +2246,11 @@ class AutoDNF:
                 time.sleep(2)
                 continue
             if find("再次挑战", boxes) and find("领奖结算", boxes):
+                no_retry_frames = 0
                 self.collect_visible_rewards()
                 town_exit_expected = self.retry_or_exit()
                 continue
+            no_retry_frames = 0
             # After final settlement the exhausted party remains inside the
             # dungeon and still shows multiple /100 HUD labels. An exact
             # right-side 返回城镇 button is therefore stronger evidence than
@@ -2271,6 +2319,39 @@ class AutoDNF:
         )
         if state == "entry material confirmation":
             self.click_right_button("确认", window, boxes, "entry material confirmation")
+            time.sleep(1.2)
+
+    def cancel_unexpected_dungeon_entry_confirmation(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Cancel a material dialog opened by accidentally touching a portal."""
+        if not find("使用角色金库", boxes):
+            return False
+        choices = [
+            box
+            for box in exact("取消", boxes)
+            if 0.25 < box.center[0] < 0.55
+            and 0.08 < box.center[1] < 0.42
+        ]
+        print("Unexpected portal entry confirmation detected; clicking 取消")
+        cancel_point = (
+            choices[0].center
+            if len(choices) == 1
+            else self.DUNGEON_ENTRY_CANCEL
+        )
+        if len(choices) != 1 and self.debug:
+            print(
+                "Could not isolate one 取消 label "
+                f"(found {len(choices)}); using title-gated fixed position"
+            )
+        self.client.click(
+            window,
+            cancel_point,
+            "cancel accidental portal entry",
+        )
+        return True
 
     def confirm_dungeon_next_challenge(
         self,
@@ -2504,6 +2585,13 @@ class AutoDNF:
         for attempt in range(1, 4):
             window = self.client.find_window()
             boxes = self.client.ocr(window)
+            if self.cancel_unexpected_dungeon_entry_confirmation(window, boxes):
+                time.sleep(0.8)
+                window, boxes = self.wait_for(
+                    ["再次挑战", "领奖结算"],
+                    "boss result after accidental portal cancellation",
+                    timeout=8,
+                )
             self.click_right_button("再次挑战", window, boxes, f"retry ({attempt}/3)")
             try:
                 state, window, boxes = self.wait_for_any(
@@ -2515,6 +2603,14 @@ class AutoDNF:
                     },
                     timeout=7,
                 )
+                if state == "entry material confirmation":
+                    self.click_right_button(
+                        "确认",
+                        window,
+                        boxes,
+                        "retry entry material confirmation",
+                    )
+                    time.sleep(1.2)
                 if state.endswith("challenge confirmation"):
                     if self.confirm_dungeon_next_challenge(window, boxes):
                         time.sleep(1.2)
@@ -2522,17 +2618,41 @@ class AutoDNF:
             except TimeoutError:
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
-                fatigue = [
-                    int(match.group(1))
-                    for box in boxes
-                    if (match := re.fullmatch(r"([0-9]{1,3})/100", box.normalized))
-                ]
-                if fatigue and min(fatigue) < 10:
+                current_fatigue = self.dungeon_current_fatigue(boxes)
+                if current_fatigue is not None and current_fatigue < 10:
+                    print(
+                        f"Active dungeon character has {current_fatigue}/100 "
+                        "fatigue; settling"
+                    )
                     self.click_right_button("领奖结算", window, boxes, "settlement exit")
                     return True
                 print("Retry did not transition; sweeping boss rewards again")
                 self.collect_visible_rewards()
         raise RuntimeError("Items still remain after three reward-collection sweeps")
+
+    @staticmethod
+    def dungeon_current_fatigue(boxes: list[TextBox]) -> int | None:
+        """Read only the active character's bottom-left dungeon HUD fatigue."""
+        readings: list[tuple[TextBox, int]] = []
+        for box in boxes:
+            normalized = box.normalized.upper().replace("O", "0").replace("I", "1")
+            match = re.fullmatch(r"([0-9]{1,3})[/|]100", normalized)
+            if (
+                match
+                and 0 <= int(match.group(1)) <= 100
+                and box.center[0] < 0.32
+                and box.center[1] < 0.30
+            ):
+                readings.append((box, int(match.group(1))))
+        if not readings:
+            return None
+        return min(
+            readings,
+            key=lambda reading: (
+                (reading[0].center[0] - 0.15) ** 2
+                + (reading[0].center[1] - 0.12) ** 2
+            ),
+        )[1]
 
     def click_right_button(self, text: str, window: Window, boxes: list[TextBox], label: str) -> None:
         choices = [box for box in exact(text, boxes) if box.center[0] > 0.5]
