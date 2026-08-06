@@ -78,7 +78,10 @@ class AutoDNF:
     # The town's 选角 text is small and Vision can return a box shifted onto
     # the button's decorative arrow. This is the stable centre of the actual
     # top-left button, expressed in window-normalized Vision coordinates.
-    CHARACTER_SELECT_POINT = (0.04, 0.82)
+    # In the returned-to-town layout the button centre is about 85% up the
+    # window.  0.82 lands just below its lower edge and can be intercepted by
+    # the quest panel after a dungeon run.
+    CHARACTER_SELECT_POINT = (0.04, 0.85)
     # The 挑战进度 board's X is lower than a standard dialog title-bar X.
     CHARACTER_BOARD_CLOSE_POINT = (0.94, 0.87)
     # Calibrated from 2956x1718 window-only captures. Coordinates below use a
@@ -1165,10 +1168,40 @@ class AutoDNF:
         self.client.click(window, max(choices, key=lambda box: box.center[1]).center, label)
 
     def return_to_town_from_page(self, title: str, state: str) -> None:
-        """Use a known page title as a gate before clicking that page's back arrow."""
-        window, _ = self.wait_for([title], state, timeout=12)
-        self.client.click(window, self.PAGE_BACK_POINT, f"back from {title}")
-        self.wait_for(["委托", "选角"], "town after page exit", timeout=25)
+        """Leave a full-screen page, retrying only while that page remains open.
+
+        The page back arrow is an icon rather than text.  A click can be lost
+        while the preceding claim animation is still settling, so a single
+        missed click must not terminate an otherwise successful maintenance
+        pass.
+        """
+        # All points remain inside the same generous arrow hit area.  The
+        # small variation helps with PlayCover's occasional touch-coordinate
+        # offset without ever clicking a page action.
+        back_points = (
+            self.PAGE_BACK_POINT,
+            (0.04, 0.96),
+            (0.045, 0.92),
+        )
+        last_error: TimeoutError | None = None
+        for attempt, point in enumerate(back_points, start=1):
+            window, _ = self.wait_for([title], state, timeout=12)
+            self.client.click(window, point, f"back from {title} ({attempt}/3)")
+            try:
+                self.wait_for(["委托", "选角"], "town after page exit", timeout=12)
+                return
+            except TimeoutError as error:
+                last_error = error
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                if not find(title, boxes):
+                    # The page did close.  Do not fire a second top-left click
+                    # into an unknown town overlay; surface the actual state.
+                    raise
+                print(f"{title} back click did not transition; retrying ({attempt}/3)")
+                time.sleep(0.6)
+        assert last_error is not None
+        raise last_error
 
     def wait_for_town_fatigue(self, timeout: float = 30) -> int | None:
         """Read town fatigue, using focused HUD OCR as a fallback to full-screen OCR."""
@@ -1237,16 +1270,38 @@ class AutoDNF:
     ) -> bool:
         """Choose the first unprocessed eligible character from the board."""
         window, boxes = self.wait_for(["委托", "选角"], "town character controls", timeout=60)
-        for attempt in range(1, 4):
-            # The rift-town NPC panel can remain open after dungeon exit and
-            # intercept the top-left 选角 button. Returning to town is a safe
-            # way to dismiss it before we retry the intended action.
-            if find("秘境传送口", boxes) and exact("返回城镇", boxes):
-                print("Detected open 秘境传送口 panel; returning to town before character selection")
-                self.click_right_button("返回城镇", window, boxes, "dismiss rift-town panel")
-                time.sleep(2)
-                window, boxes = self.wait_for(["委托", "选角"], "town after rift-panel dismissal", timeout=20)
+
+        # A real rift return panel lives in the far-right portion of the
+        # window.  Do not mistake incidental "秘境传送口" text elsewhere in
+        # town for that overlay.  Also wait for the panel itself to disappear:
+        # waiting only for town text succeeds immediately because town remains
+        # visible behind the open panel.
+        rift_dismissals = 0
+        while self.rift_town_return_panel_open(boxes):
+            rift_dismissals += 1
+            if rift_dismissals > 3:
+                print("Rift-town return panel did not close after three attempts")
+                return False
+            button = next(
+                box
+                for box in exact("返回城镇", boxes)
+                if box.center[0] > 0.78
+            )
+            print("Detected open 秘境传送口 panel; returning to town before character selection")
+            self.client.click(window, button.center, "dismiss rift-town panel")
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                time.sleep(0.5)
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                if not self.rift_town_return_panel_open(boxes):
+                    print("Rift-town panel closed")
+                    break
+            else:
+                print(f"Rift-town panel is still open; retrying ({rift_dismissals}/3)")
                 continue
+
+        for attempt in range(1, 4):
             self.client.click(
                 window,
                 self.CHARACTER_SELECT_POINT,
@@ -1284,6 +1339,11 @@ class AutoDNF:
         stable_empty_frames = 0
         unchanged_scrolls = 0
         scrolls = 0
+        # The first view is special: when starting from the top we must not
+        # skip an earlier role simply because OCR missed one of its values.
+        # Once we have deliberately advanced the list, however, a partially
+        # read row must not pin the scanner on the same screen forever.
+        initial_board_view = True
         # Once the current 在线 row has been positively located, every later
         # scrolled view is necessarily below it. Keep that fact even after the
         # marker itself moves off-screen.
@@ -1311,7 +1371,7 @@ class AutoDNF:
                 and row.fatigue >= minimum_fatigue
             ]
             initial_prefix_unreadable = False
-            if not processed and available:
+            if not processed and available and initial_board_view:
                 # At the initial top-of-list scan, never treat the current
                 # 在线 row as the first eligible character merely because OCR
                 # missed a preceding row's level or fatigue. Every complete
@@ -1332,7 +1392,7 @@ class AutoDNF:
                             "or reusing the 在线 role"
                         )
                     available = []
-            elif not processed:
+            elif not processed and initial_board_view:
                 initial_prefix_unreadable = any(
                     row.level is None or row.fatigue is None
                     for row in rows
@@ -1459,6 +1519,10 @@ class AutoDNF:
                     end=(0.50, 0.35 + self.CHARACTER_BOARD_ROW_PITCH),
                     label="character list downward",
                 )
+                # From this point on, incomplete OCR is a normal condition:
+                # use stable row geometry to keep exploring instead of
+                # repeatedly re-reading the same visible rows.
+                initial_board_view = False
                 time.sleep(0.7)
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
@@ -2186,7 +2250,7 @@ class AutoDNF:
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             if find("入场材料", boxes) and exact("入场", boxes):
-                self.click_right_button("入场", window, boxes, "entry")
+                self.click_fresh_entry_button("entry")
                 _, window, boxes = self.wait_for_any(
                     {
                         "entry material confirmation": ["使用角色金库"],
@@ -2325,7 +2389,7 @@ class AutoDNF:
 
     def enter_dungeon(self) -> None:
         window, boxes = self.wait_for(["入场", "入场材料"], "ready formation")
-        self.click_right_button("入场", window, boxes, "entry")
+        self.click_fresh_entry_button("entry")
         state, window, boxes = self.wait_for_any(
             {
                 "entry material confirmation": ["使用角色金库"],
@@ -2682,20 +2746,54 @@ class AutoDNF:
             raise RuntimeError(f"Could not identify exact right-side {text!r} button")
         self.client.click(window, choices[0].center, label)
 
+    @staticmethod
+    def rift_town_return_panel_open(boxes: list[TextBox]) -> bool:
+        """Identify the actual far-right rift return overlay, not town labels."""
+        return (
+            any(box.center[0] > 0.78 for box in find("秘境传送口", boxes))
+            and any(box.center[0] > 0.78 for box in exact("返回城镇", boxes))
+        )
+
+    def click_fresh_entry_button(self, label: str) -> None:
+        """OCR-locate the lower-right 入场 button in the latest rendered frame."""
+        window = self.client.find_window()
+        boxes = self.client.ocr(window)
+        choices = [
+            box
+            for box in exact("入场", boxes)
+            if box.center[0] > 0.75 and box.center[1] < 0.18
+        ]
+        if len(choices) != 1:
+            raise RuntimeError(
+                f"Could not freshly identify one lower-right 入场 button (found {len(choices)})"
+            )
+        self.client.click(window, choices[0].center, label)
+
     def click_entry_material_confirmation(
         self,
         window: Window,
         boxes: list[TextBox],
         label: str,
     ) -> None:
-        """Click the upper half of the entry-material confirmation button."""
-        choices = [box for box in exact("确认", boxes) if box.center[0] > 0.5]
+        """Freshly locate the team-entry confirmation before clicking it."""
+        # This dialog appears over an animated party screen, so the OCR frame
+        # that detected it can be vertically stale by the time an input event
+        # is sent. Read the settled dialog once more immediately before click.
+        window = self.client.find_window()
+        boxes = self.client.ocr(window)
+        choices = [
+            box
+            for box in exact("确认", boxes)
+            if 0.45 < box.center[0] < 0.75 and 0.12 < box.center[1] < 0.40
+        ]
         if len(choices) != 1:
-            raise RuntimeError("Could not identify exact entry-material confirmation button")
+            raise RuntimeError(
+                "Could not freshly identify exact team-entry confirmation button"
+            )
         box = choices[0]
         # Text OCR lands slightly low within this tall button. Vision uses a
         # bottom-left origin, so increasing y moves the click physically up.
-        point = (box.center[0], min(0.98, box.center[1] + 0.025))
+        point = (box.center[0], min(0.98, box.center[1] + 0.018))
         self.client.click(window, point, label)
 
     def eligible_cards(
