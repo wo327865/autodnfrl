@@ -52,6 +52,16 @@ class AutoDNF:
     # dungeon material-source dialog. This is used only when the dialog title
     # is visible but OCR misses the button itself.
     DUNGEON_ENTRY_CANCEL = (0.43, 0.22)
+    # Fixed controls for the insufficient-entry-material ``一键制作`` flow.
+    # They are normalized to the PlayCover content window (Vision's
+    # bottom-left coordinate system), so they remain correct when the window
+    # is scaled.  We deliberately do not use OCR coordinates for these
+    # controls: their labels often sit above the actual hit areas.
+    ENTRY_CRAFT_QUANTITY = (0.518, 0.292)  # the visible "10" quantity field
+    ENTRY_CRAFT_MAXIMUM = (0.953, 0.584)  # 最大 in the right input keypad
+    ENTRY_CRAFT_INPUT = (0.953, 0.283)  # 输入 in the right input keypad
+    ENTRY_CRAFT_CONFIRM = (0.563, 0.111)  # 确认 in 一键制作
+    ENTRY_CRAFT_FINAL_CONFIRM = (0.580, 0.390)  # follow-up 提示 dialog
     # This harmless informational dialog can appear shortly after switching
     # characters. Gate the generic 确认 button behind unique guild-sign-in text
     # so an unrelated confirmation can never be accepted automatically.
@@ -391,6 +401,8 @@ class AutoDNF:
         source_texts: list[str],
         next_states: dict[str, list[str]],
         retries: int = 3,
+        post_click_delay: float = 0.7,
+        retry_source_timeout: float = 3.0,
     ) -> tuple[str, Window, list[TextBox]]:
         """Click an action and retry only if its source screen remains.
 
@@ -404,13 +416,17 @@ class AutoDNF:
                 print("Dismissed activity popup; retrying the original action")
                 continue
             self.click_from_boxes(text, window, boxes, f"{text} ({attempt}/{retries})")
-            time.sleep(0.7)
+            time.sleep(post_click_delay)
             try:
                 return self.wait_for_any(next_states, timeout=9)
             except TimeoutError:
                 # Retry only after positively seeing the original screen again.
                 try:
-                    self.wait_for(source_texts, source_state, timeout=3)
+                    self.wait_for(
+                        source_texts,
+                        source_state,
+                        timeout=retry_source_timeout,
+                    )
                 except TimeoutError:
                     # The old screen is gone: continue waiting rather than
                     # issuing a duplicate click into an unknown loading state.
@@ -674,6 +690,8 @@ class AutoDNF:
             "town before mailbox",
             ["委托", "邮箱"],
             {"mailbox": ["角色邮件"]},
+            post_click_delay=0.45,
+            retry_source_timeout=1.5,
         )
         window, boxes = self.wait_for(["角色邮件"], "mailbox", timeout=15)
         skip_character = bool(find("背包已满", boxes))
@@ -682,14 +700,21 @@ class AutoDNF:
         elif find("未收到邮件", boxes):
             print("No character mail to claim")
         else:
-            claim = exact("领取全部物品", boxes)
-            if len(claim) == 1:
+            # A mailbox can contain several claimable batches.  Continue only
+            # while the role-mail count says entries remain; the disabled
+            # claim-all label itself is not proof of pending attachments.
+            for batch in range(1, 6):
+                claim = exact("领取全部物品", boxes)
+                if len(claim) != 1:
+                    print("No enabled claim-all mail button was detected")
+                    break
                 claim_point = claim[0].center
+                claimed_batch = False
                 for claim_attempt in range(1, 3):
                     self.client.click(
                         window,
                         claim_point,
-                        f"claim all mail items ({claim_attempt}/2)",
+                        f"claim all mail items (batch {batch}, attempt {claim_attempt}/2)",
                     )
                     state, window, boxes = self.wait_for_mail_claim_result()
                     if state == "backpack full":
@@ -700,19 +725,13 @@ class AutoDNF:
                         skip_character = True
                         break
                     if state == "mail claim reward":
-                        self.click_topmost_right_confirmation(
-                            window,
-                            boxes,
-                            "confirm mail claim",
-                        )
-                        self.wait_for_settled_mailbox_after_claim()
-                        print("Claimed all character mail")
+                        window, boxes = self.confirm_mail_reward_and_wait()
+                        claimed_batch = True
+                        print(f"Claimed character-mail batch {batch}")
                         break
 
-                    # No foreground result appeared. If the mailbox is still
-                    # present and not explicitly empty, the network may have
-                    # dropped the click. Retry exactly once, refreshing the
-                    # button coordinate when OCR can still read it.
+                    # The network can drop the initial claim input. Refresh
+                    # its OCR centre and make one quicker retry.
                     refreshed_claim = exact("领取全部物品", boxes)
                     if len(refreshed_claim) == 1:
                         claim_point = refreshed_claim[0].center
@@ -725,19 +744,21 @@ class AutoDNF:
                             "Claim-all produced no effect and the mailbox is "
                             "still unchanged; retrying once"
                         )
-                        time.sleep(0.6)
+                        time.sleep(0.35)
                         continue
-
-                    # A disabled claim button can remain OCR-visible when the
-                    # mailbox has no attachments. After the one permitted
-                    # retry, a settled foreground-free mailbox is empty.
                     print(
                         "Mail claim did not open a reward dialog after the "
                         "allowed attempt(s); treating mailbox as empty"
                     )
                     break
+                if skip_character or not claimed_batch:
+                    break
+                if not self.character_mail_items_remain(boxes):
+                    break
+                print("Character mail remains after claim; claiming the next batch")
+                time.sleep(0.35)
             else:
-                print("No enabled claim-all mail button was detected")
+                print("Stopped mail claim after five batches for this character")
         self.return_to_town_from_page("邮箱", "mailbox")
         return not skip_character
 
@@ -857,7 +878,58 @@ class AutoDNF:
             time.sleep(0.4)
         raise TimeoutError("Timed out waiting for the mail-claim result to finish rendering")
 
-    def wait_for_settled_mailbox_after_claim(self, timeout: float = 15) -> None:
+    def confirm_mail_reward_and_wait(
+        self,
+        attempts: int = 3,
+    ) -> tuple[Window, list[TextBox]]:
+        """Dismiss a claimed-items dialog and verify that it actually closed."""
+        last_error: TimeoutError | None = None
+        for attempt in range(1, attempts + 1):
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+            choices = [
+                box
+                for box in exact("确认", boxes)
+                if 0.48 < box.center[0] < 0.76
+                and 0.12 < box.center[1] < 0.48
+            ]
+            if len(choices) != 1:
+                # The button can arrive a frame after the title. Give the
+                # animation a brief retry instead of failing the whole role.
+                time.sleep(0.3)
+                continue
+            self.client.click(
+                window,
+                choices[0].center,
+                f"confirm mail claim ({attempt}/{attempts})",
+            )
+            try:
+                return self.wait_for_settled_mailbox_after_claim(timeout=6)
+            except TimeoutError as error:
+                last_error = error
+                print(f"Mail reward confirmation did not close; retrying ({attempt}/{attempts})")
+                time.sleep(0.35)
+        if last_error is not None:
+            raise last_error
+        raise TimeoutError("Mail reward confirmation button did not become readable")
+
+    @staticmethod
+    def character_mail_items_remain(boxes: list[TextBox]) -> bool:
+        """Read the role-mail counter, without treating a disabled button as mail."""
+        for box in boxes:
+            match = re.fullmatch(r"([0-9]{1,3})/101", box.normalized)
+            if (
+                match
+                and box.center[0] < 0.20
+                and box.center[1] > 0.65
+            ):
+                return int(match.group(1)) > 0
+        return False
+
+    def wait_for_settled_mailbox_after_claim(
+        self,
+        timeout: float = 15,
+    ) -> tuple[Window, list[TextBox]]:
         """Require the reward overlay to disappear before clicking mailbox Back."""
         deadline = time.monotonic() + timeout
         stable_frames = 0
@@ -874,7 +946,7 @@ class AutoDNF:
                 stable_frames += 1
                 if stable_frames >= 3:
                     print("Detected settled mailbox after claim")
-                    return
+                    return window, boxes
             else:
                 stable_frames = 0
             time.sleep(0.4)
@@ -1720,10 +1792,39 @@ class AutoDNF:
             )
             # Calibration samples: online=0.241; every other row <=0.002.
             online = green_ratio >= 0.08
-            # A focused Vision pass can occasionally emit both 8 and 80 at
-            # nearly the same badge. Prefer the complete larger reading.
-            level = max(levels, default=None)
             fatigue = fatigues[0] if len(set(fatigues)) == 1 else None
+            # A focused Vision pass can occasionally emit both 8 and 80 at
+            # nearly the same badge. Prefer the complete larger reading. If
+            # the shared left-column OCR missed this particular badge, make a
+            # second, row-local pass before allowing a fresh-fatigue role to
+            # be skipped at the bottom of the board.
+            level = max(levels, default=None)
+            if level is None and fatigue is not None:
+                badge_boxes = self.client.ocr_region(
+                    window,
+                    (
+                        0.06,
+                        1.0 - (top + 0.98 * height),
+                        0.12,
+                        0.78 * height,
+                    ),
+                    language_correction=False,
+                )
+                badge_levels = []
+                for box in badge_boxes:
+                    match = re.fullmatch(
+                        r"[^0-9]*([0-9]{1,3})[^0-9]*",
+                        box.normalized,
+                    )
+                    if match and 1 <= int(match.group(1)) <= 100:
+                        badge_levels.append(int(match.group(1)))
+                if badge_levels:
+                    level = max(badge_levels)
+                    if self.debug:
+                        print(
+                            f"Recovered character-board level {level} "
+                            "with row-local badge OCR"
+                        )
             result.append(
                 CharacterBoardRow(
                     top=top,
@@ -1853,21 +1954,14 @@ class AutoDNF:
                     key=lambda reading: abs(reading[0].center[0] - 0.68),
                 )[1]
             slots = sorted(find("可配置角色", boxes), key=lambda box: box.center[0])
-            party_fatigue = len(find("100/100", boxes))
-            party_power = len(
-                [
-                    box
-                    for box in boxes
-                    if re.fullmatch(r"[0-9]{1,3}(?:[,，][0-9]{3})+", box.text or "")
-                ]
-            )
-            if party_fatigue >= 3 or party_power >= 3:
+            party_members = self.visible_party_member_count(boxes)
+            if party_members >= 3:
                 print("Detected an existing three-character formation")
                 return True
             if slots:
                 slot_point = (slots[0].center[0], 0.58)
                 break
-            if party_fatigue == 1 or party_power == 1:
+            if party_members == 1:
                 # Vision can miss the grey empty-slot text. The screen and
                 # single-character state are verified before this layout click.
                 slot_point = (0.49, 0.58)
@@ -2179,22 +2273,17 @@ class AutoDNF:
         companions_selected: int,
         exhausted: bool = False,
     ) -> bool:
-        """Save a complete or partial formation, but never a solo formation."""
-        if companions_selected == 0:
+        """Save a formation only when at least one companion was added."""
+        if companions_selected < 1:
             print(
-                "No eligible companion could be added; cancelling party "
-                "setup and stopping before dungeon entry"
+                "No eligible companion could be added; cancelling party setup "
+                "and stopping before dungeon entry"
             )
             # Escape is delivered to PlayCover as Android Back and safely
             # closes the character picker without saving a solo formation.
             self.client.press(53)
             time.sleep(0.8)
             return False
-        if exhausted:
-            print(
-                f"No further eligible companion found; entering with "
-                f"{companions_selected} selected companion(s)"
-            )
         for attempt in range(1, 4):
             if not self.click_fresh_party_complete(f"编队完成 ({attempt}/3)"):
                 time.sleep(0.6)
@@ -2215,10 +2304,51 @@ class AutoDNF:
                     break
                 time.sleep(0.4)
             if picker_absent_frames >= 2:
-                print("Party formation saved")
-                return True
+                return self.verify_complete_party_formation()
             print(f"编队完成 did not close the picker; retrying ({attempt}/3)")
         raise RuntimeError("Party picker did not close after 编队完成")
+
+    @staticmethod
+    def visible_party_member_count(boxes: list[TextBox]) -> int:
+        """Count rendered role cards on the Normal Realm formation screen."""
+        fatigue_cards = [
+            box
+            for box in boxes
+            if re.fullmatch(r"[0-9]{1,3}/100", box.normalized)
+            and 0.40 < box.center[0] < 0.98
+            and 0.15 < box.center[1] < 0.55
+        ]
+        # Card power is a fallback when an animated stamina icon obstructs a
+        # /100 label. Restrict it to the same card strip to exclude materials.
+        power_cards = [
+            box
+            for box in boxes
+            if re.fullmatch(r"[0-9]{1,3}(?:[,，][0-9]{3})+", box.normalized)
+            and 0.40 < box.center[0] < 0.98
+            and 0.15 < box.center[1] < 0.60
+        ]
+        return max(len(fatigue_cards), len(power_cards))
+
+    def verify_complete_party_formation(self) -> bool:
+        """Require the current role plus at least one visible companion."""
+        deadline = time.monotonic() + 6
+        highest_count = 0
+        while time.monotonic() < deadline:
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+            if not find("普通秘境", boxes):
+                time.sleep(0.35)
+                continue
+            highest_count = max(highest_count, self.visible_party_member_count(boxes))
+            if highest_count >= 2:
+                print("Party formation saved with current role and companion")
+                return True
+            time.sleep(0.35)
+        print(
+            f"Only {highest_count} visible party member(s) after 编队完成; "
+            "stopping before dungeon entry"
+        )
+        return False
 
     def click_fresh_party_complete(self, label: str) -> bool:
         """Locate 编队完成 in the latest picker frame before clicking it."""
@@ -2250,17 +2380,7 @@ class AutoDNF:
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             if find("入场材料", boxes) and exact("入场", boxes):
-                self.click_fresh_entry_button("entry")
-                _, window, boxes = self.wait_for_any(
-                    {
-                        "entry material confirmation": ["使用角色金库"],
-                        "dungeon": ["秘境："],
-                    },
-                    timeout=20,
-                )
-                if find("使用角色金库", boxes):
-                    self.click_entry_material_confirmation(window, boxes, "entry material confirmation")
-                    time.sleep(1.2)
+                self.enter_dungeon()
         deadline = time.monotonic() + 60 * 60
         town_frames = 0
         no_retry_frames = 0
@@ -2301,6 +2421,11 @@ class AutoDNF:
                 if self.cancel_unexpected_dungeon_entry_confirmation(window, boxes):
                     time.sleep(0.8)
                 continue
+            # Loot collection is allowed only on the dedicated boss-result
+            # panel.  Text recognition elsewhere in a dungeon can transiently
+            # produce result-like words, so require the actual far-right
+            # action-button locations before treating a room as completed.
+            boss_retry, boss_settlement = self.boss_result_action_buttons(boxes)
             if self.confirm_dungeon_next_challenge(window, boxes):
                 town_frames = 0
                 time.sleep(1.2)
@@ -2310,7 +2435,7 @@ class AutoDNF:
             # the result scene still contains 0/100 party HUD labels. Require
             # two consecutive frames: a transient OCR miss of 再次挑战 must not
             # send a still-usable active character back to town.
-            if find("领奖结算", boxes) and not find("再次挑战", boxes):
+            if boss_settlement and not boss_retry:
                 no_retry_frames += 1
                 if no_retry_frames < 2:
                     if self.debug:
@@ -2321,11 +2446,15 @@ class AutoDNF:
                 self.collect_visible_rewards()
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
-                self.click_right_button("领奖结算", window, boxes, "settlement exit")
+                _, settlement_buttons = self.boss_result_action_buttons(boxes)
+                if len(settlement_buttons) != 1:
+                    print("Boss-result controls disappeared before settlement; resuming dungeon scan")
+                    continue
+                self.client.click(window, settlement_buttons[0].center, "settlement exit")
                 town_exit_expected = True
                 time.sleep(2)
                 continue
-            if find("再次挑战", boxes) and find("领奖结算", boxes):
+            if boss_retry and boss_settlement:
                 no_retry_frames = 0
                 self.collect_visible_rewards()
                 town_exit_expected = self.retry_or_exit()
@@ -2361,8 +2490,8 @@ class AutoDNF:
             # before rewards are collected. Require an exact town control,
             # no dungeon/result evidence, and two consecutive OCR frames.
             dungeon_evidence = (
-                bool(find("再次挑战", boxes))
-                or bool(find("领奖结算", boxes))
+                bool(boss_retry)
+                or bool(boss_settlement)
                 or bool(find("秘境：", boxes))
                 or len(find("/100", boxes)) >= 2
             )
@@ -2388,18 +2517,38 @@ class AutoDNF:
         raise TimeoutError("Battle safety limit reached")
 
     def enter_dungeon(self) -> None:
-        window, boxes = self.wait_for(["入场", "入场材料"], "ready formation")
-        self.click_fresh_entry_button("entry")
-        state, window, boxes = self.wait_for_any(
-            {
-                "entry material confirmation": ["使用角色金库"],
-                "dungeon": ["秘境："],
-            },
-            timeout=20,
-        )
-        if state == "entry material confirmation":
-            self.click_entry_material_confirmation(window, boxes, "entry material confirmation")
-            time.sleep(1.2)
+        """Enter the dungeon, crafting missing entry materials once if needed."""
+        # A successful 一键制作 returns to this formation page; re-clicking
+        # 入场 is required to consume the newly made materials. Network/UI
+        # input can also drop an entry click, so permit three total attempts.
+        for attempt in range(1, 4):
+            window, boxes = self.wait_for(["入场", "入场材料"], "ready formation")
+            self.click_fresh_entry_button(f"entry ({attempt}/3)")
+            try:
+                state, window, boxes = self.wait_for_any(
+                    {
+                        "entry material confirmation": ["使用角色金库"],
+                        "insufficient entry materials": ["一键制作"],
+                        "dungeon": ["秘境："],
+                    },
+                    timeout=20,
+                )
+            except TimeoutError:
+                if attempt == 3:
+                    raise TimeoutError("入场 did not reach dungeon after three attempts")
+                print(f"入场 did not transition; retrying ({attempt}/3)")
+                time.sleep(0.8)
+                continue
+            if state == "dungeon":
+                return
+            if state == "insufficient entry materials":
+                self.craft_maximum_entry_materials(window, boxes)
+                continue
+            if not self.resolve_entry_material_confirmation(window, boxes, "entry material confirmation"):
+                # The confirmation was accepted and the game is loading the
+                # dungeon. The battle loop will continue its normal polling.
+                return
+        raise RuntimeError("Entry materials are still insufficient after three entry attempts")
 
     def cancel_unexpected_dungeon_entry_confirmation(
         self,
@@ -2667,6 +2816,24 @@ class AutoDNF:
         middle = len(pile) // 2
         return xs[middle], ys[middle]
 
+    @staticmethod
+    def boss_result_action_buttons(
+        boxes: list[TextBox],
+    ) -> tuple[list[TextBox], list[TextBox]]:
+        """Return only the fixed far-right boss-result action labels.
+
+        Generic OCR text must never authorize loot collection.  Both result
+        actions live in the right-side vertical button stack, well above the
+        skill bar; words recognized elsewhere in an active room are ignored.
+        """
+        def result_lane(box: TextBox) -> bool:
+            return 0.75 < box.center[0] < 0.99 and 0.55 < box.center[1] < 0.93
+
+        return (
+            [box for box in exact("再次挑战", boxes) if result_lane(box)],
+            [box for box in exact("领奖结算", boxes) if result_lane(box)],
+        )
+
     def retry_or_exit(self) -> bool:
         """Retry the dungeon, returning True only when settlement was chosen."""
         for attempt in range(1, 4):
@@ -2679,24 +2846,37 @@ class AutoDNF:
                     "boss result after accidental portal cancellation",
                     timeout=8,
                 )
-            self.click_right_button("再次挑战", window, boxes, f"retry ({attempt}/3)")
+            retry_buttons, settlement_buttons = self.boss_result_action_buttons(boxes)
+            if len(retry_buttons) != 1 or len(settlement_buttons) != 1:
+                print("Boss-result controls are no longer present; resuming dungeon movement")
+                return False
+            self.client.click(window, retry_buttons[0].center, f"retry ({attempt}/3)")
             try:
                 state, window, boxes = self.wait_for_any(
                     {
                         "next dungeon": ["秘境："],
                         "entry material confirmation": ["使用角色金库"],
+                        "insufficient entry materials": ["一键制作"],
                         "next challenge confirmation": ["再次挑战", "确认"],
                         "start challenge confirmation": ["开始挑战", "确认"],
                     },
                     timeout=7,
                 )
                 if state == "entry material confirmation":
-                    self.click_entry_material_confirmation(
+                    crafted_materials = self.resolve_entry_material_confirmation(
                         window,
                         boxes,
                         "retry entry material confirmation",
                     )
-                    time.sleep(1.2)
+                    if crafted_materials:
+                        # 一键制作 returns to the formation page. Start the
+                        # normal entry sequence again with the new materials.
+                        self.enter_dungeon()
+                if state == "insufficient entry materials":
+                    self.craft_maximum_entry_materials(window, boxes)
+                    # 一键制作 returns to the formation page, where the
+                    # freshly crafted materials still need an 入场 click.
+                    self.enter_dungeon()
                 if state.endswith("challenge confirmation"):
                     if self.confirm_dungeon_next_challenge(window, boxes):
                         time.sleep(1.2)
@@ -2705,12 +2885,19 @@ class AutoDNF:
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
                 current_fatigue = self.dungeon_current_fatigue(boxes)
+                retry_buttons, settlement_buttons = self.boss_result_action_buttons(boxes)
+                if not retry_buttons and not settlement_buttons:
+                    print("Boss-result controls disappeared after retry; resuming dungeon movement")
+                    return False
                 if current_fatigue is not None and current_fatigue < 10:
                     print(
                         f"Active dungeon character has {current_fatigue}/100 "
                         "fatigue; settling"
                     )
-                    self.click_right_button("领奖结算", window, boxes, "settlement exit")
+                    if len(settlement_buttons) != 1:
+                        print("Settlement button was not stable; resuming dungeon movement")
+                        return False
+                    self.client.click(window, settlement_buttons[0].center, "settlement exit")
                     return True
                 print("Retry did not transition; sweeping boss rewards again")
                 self.collect_visible_rewards()
@@ -2795,6 +2982,158 @@ class AutoDNF:
         # bottom-left origin, so increasing y moves the click physically up.
         point = (box.center[0], min(0.98, box.center[1] + 0.018))
         self.client.click(window, point, label)
+
+    def resolve_entry_material_confirmation(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+        label: str,
+    ) -> bool:
+        """Accept the vault prompt and craft materials if its shortage dialog opens.
+
+        Returns ``True`` only when the fixed-coordinate 一键制作 sequence ran,
+        which means the caller must press 入场 again afterwards.
+        """
+        self.click_entry_material_confirmation(window, boxes, label)
+        state, window, boxes = self.wait_for_any(
+            {
+                # This helper is entered only after the uniquely titled vault
+                # confirmation.  The craft title is a more reliable state
+                # gate than the animated numeric shortage sentence.
+                "insufficient entry materials": ["一键制作"],
+                "dungeon": ["秘境："],
+            },
+            timeout=18,
+        )
+        if state == "dungeon":
+            return False
+        self.craft_maximum_entry_materials(window, boxes)
+        return True
+
+    def craft_maximum_entry_materials(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> None:
+        """Use the fixed controls in the insufficient-entry-material dialog.
+
+        The visual wording gates each step, but all four actions use the
+        calibrated button centres rather than unstable OCR bounding boxes:
+        quantity -> 最大 -> 输入 -> 制作确认 -> final confirmation.
+        """
+        if not find("一键制作", boxes):
+            raise RuntimeError("Expected the insufficient-entry-material 一键制作 dialog")
+        print("Insufficient entry materials; crafting the maximum amount")
+        self.client.click(window, self.ENTRY_CRAFT_QUANTITY, "entry material quantity")
+        window, boxes = self.wait_for(["输入数量"], "entry material quantity keypad", timeout=8)
+        self.client.click(window, self.ENTRY_CRAFT_MAXIMUM, "maximum entry material quantity")
+        # 最大 populates the field but intentionally leaves this keypad open.
+        # Give its value animation time to settle. The tall, rightmost 输入
+        # button is then clicked at this fixed point; retry only if that same
+        # keypad is still visible, so a later click cannot land on the craft
+        # dialog beneath it.
+        time.sleep(0.55)
+        keypad_closed = False
+        for attempt in range(1, 4):
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+            if not find("输入数量", boxes):
+                keypad_closed = True
+                break
+            self.client.click(
+                window,
+                self.ENTRY_CRAFT_INPUT,
+                f"apply maximum entry material quantity ({attempt}/3)",
+            )
+            time.sleep(0.7)
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+            if not find("输入数量", boxes):
+                keypad_closed = True
+                break
+        if not keypad_closed:
+            raise TimeoutError("Maximum entry-material quantity keypad did not close")
+
+        if not find("一键制作", boxes):
+            window, boxes = self.wait_for(["一键制作"], "entry material craft dialog", timeout=5)
+
+        self.client.click(window, self.ENTRY_CRAFT_CONFIRM, "confirm maximum entry material craft")
+        # The crafting animation promotes a second foreground confirmation
+        # after a short delay. Do not race that transition with any following
+        # click; the game otherwise receives the second event too early.
+        time.sleep(0.5)
+
+        # The formation's 入场 text is still visible through dimmed craft
+        # dialogs, so do not use a simple positive "入场" wait here.
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+            if find("使用角色金库", boxes):
+                # This is the post-craft material-source confirmation shown
+                # above 一键制作. Fresh OCR locates the shifted 确认 text, then
+                # the existing helper applies its small upward click offset.
+                time.sleep(0.5)
+                self.click_entry_material_confirmation(
+                    window,
+                    boxes,
+                    "confirm crafted entry materials",
+                )
+                time.sleep(0.5)
+                # This only confirms the material source. The actual craft
+                # confirmation, 制作材料/消耗品, is still expected next.
+                continue
+            if find("制作材料", boxes) or find("消耗品", boxes):
+                # Final confirmation after the material-source prompt. The
+                # fixed point is the right button in this centred dialog.
+                time.sleep(0.5)
+                self.client.click(
+                    window,
+                    self.ENTRY_CRAFT_FINAL_CONFIRM,
+                    "final crafted material confirmation",
+                )
+                time.sleep(0.5)
+                self.wait_for_entry_craft_overlays_to_close()
+                return
+            if find("提示", boxes) and exact("确认", boxes):
+                # This is a standard centred 提示 dialog. Its button location
+                # is fixed separately from the lower 一键制作 confirmation.
+                self.client.click(
+                    window,
+                    self.ENTRY_CRAFT_FINAL_CONFIRM,
+                    "final entry material craft confirmation",
+                )
+                time.sleep(0.5)
+                self.wait_for_entry_craft_overlays_to_close()
+                return
+            if (
+                find("入场", boxes)
+                and find("入场材料", boxes)
+                and not find("一键制作", boxes)
+                and not find("制作材料", boxes)
+                and not find("使用角色金库", boxes)
+            ):
+                return
+            time.sleep(0.3)
+        raise TimeoutError("Entry-material craft did not finish")
+
+    def wait_for_entry_craft_overlays_to_close(self, timeout: float = 15) -> None:
+        """Wait for the true formation, excluding its dimmed craft background."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+            if (
+                find("入场", boxes)
+                and find("入场材料", boxes)
+                and not find("一键制作", boxes)
+                and not find("制作材料", boxes)
+                and not find("使用角色金库", boxes)
+            ):
+                print("Entry materials crafted; ready to enter dungeon")
+                return
+            time.sleep(0.3)
+        raise TimeoutError("Entry-material craft overlays did not close")
 
     def eligible_cards(
         self,
