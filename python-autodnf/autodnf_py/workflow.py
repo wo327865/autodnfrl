@@ -651,6 +651,7 @@ class AutoDNF:
 
     def run_mail_maintenance_all(self) -> None:
         """Claim character mail and dismantle equipment for every eligible role once."""
+        self.return_from_abyss_pages_for_maintenance()
         processed: set[str] = set()
         completed = 0
         while True:
@@ -683,6 +684,42 @@ class AutoDNF:
                         "the next character"
                     )
 
+    def return_from_abyss_pages_for_maintenance(self) -> None:
+        """Leave the two Abyss pages before maintenance begins.
+
+        A battle can end while the Normal Realm formation screen is still
+        open, especially when no companion is available.  That screen needs
+        one top-left Back click to return to the 时空秘境 selector, followed by
+        a second one to return to town.  Maintenance always starts in town.
+        """
+        window = self.client.find_window()
+        boxes = self.client.ocr(window)
+        if exact("委托", boxes) and exact("选角", boxes):
+            return
+
+        if find("普通秘境", boxes) and find("入场材料", boxes):
+            print("Maintenance is starting from Normal Realm; returning to 时空秘境")
+            self.client.click(window, self.PAGE_BACK_POINT, "back from 普通秘境")
+            _, window, boxes = self.wait_for_any(
+                {
+                    "时空秘境 selector": ["时空秘境", "普通秘境"],
+                    "town": ["委托", "选角"],
+                },
+                timeout=15,
+            )
+
+        if not (exact("委托", boxes) and exact("选角", boxes)) and (
+            find("时空秘境", boxes) and find("普通秘境", boxes)
+        ):
+            print("Maintenance is starting from 时空秘境; returning to town")
+            self.client.click(window, self.PAGE_BACK_POINT, "back from 时空秘境")
+            self.wait_for(["委托", "选角"], "town before maintenance", timeout=20)
+            return
+
+        if exact("委托", boxes) and exact("选角", boxes):
+            return
+        raise RuntimeError("Maintenance must start from town or an Abyss formation/selector page")
+
     def receive_all_character_mail(self) -> bool:
         """Open character mail, claim all mail when present, then return to town."""
         self.click_then_wait(
@@ -708,6 +745,7 @@ class AutoDNF:
                 if len(claim) != 1:
                     print("No enabled claim-all mail button was detected")
                     break
+                time.sleep(0.35)
                 claim_point = claim[0].center
                 claimed_batch = False
                 for claim_attempt in range(1, 3):
@@ -744,7 +782,7 @@ class AutoDNF:
                             "Claim-all produced no effect and the mailbox is "
                             "still unchanged; retrying once"
                         )
-                        time.sleep(0.35)
+                        time.sleep(0.175)
                         continue
                     print(
                         "Mail claim did not open a reward dialog after the "
