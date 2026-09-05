@@ -697,6 +697,25 @@ class AutoDNF:
         if exact("委托", boxes) and exact("选角", boxes):
             return
 
+        # The battle character-rotation loop can stop at the bottom of the
+        # 挑战进度 board after finding no further fatigue-eligible role. That
+        # board is neither town nor an Abyss page, but it has a stable close X
+        # and must be dismissed before maintenance can begin.
+        character_board_open = bool(find("挑战进度", boxes)) or (
+            bool(find("选择角色", boxes))
+            and bool(find("开始游戏", boxes))
+            and bool(find("玩法设置", boxes))
+        )
+        if character_board_open:
+            print("Maintenance is starting from character selection; returning to town")
+            self.client.click(
+                window,
+                self.CHARACTER_BOARD_CLOSE_POINT,
+                "close character selection before maintenance",
+            )
+            self.wait_for(["委托", "选角"], "town before maintenance", timeout=20)
+            return
+
         if find("普通秘境", boxes) and find("入场材料", boxes):
             print("Maintenance is starting from Normal Realm; returning to 时空秘境")
             self.client.click(window, self.PAGE_BACK_POINT, "back from 普通秘境")
