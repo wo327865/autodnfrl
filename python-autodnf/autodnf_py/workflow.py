@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .detector import LootPileDetector
 from .macos import MacClient, TextBox, Window
@@ -118,6 +118,10 @@ class AutoDNF:
     # Page-level back arrows (邮箱 / 背包) sit below and right of the app
     # window's outer top-left edge.
     PAGE_BACK_POINT = (0.04, 0.94)
+    # Abyss pages place a separate arrow immediately to the left of their
+    # top-left title.  PAGE_BACK_POINT is too far right for this control and
+    # can land on the title instead of the arrow.
+    ABYSS_BACK_POINT = (0.018, 0.96)
     STORY_SKIP_FALLBACK_POINT = (0.94, 0.93)
     DISMANTLE_TEMPLATE_NAMES = (
         "dismantle_open",
@@ -684,6 +688,77 @@ class AutoDNF:
                         "the next character"
                     )
 
+    def wait_for_maintenance_town(
+        self,
+        state: str,
+        timeout: float = 18,
+    ) -> tuple[Window, list[TextBox]]:
+        """Wait for any town layout from which maintenance can proceed.
+
+        Some town variants obscure or OCR-miss the small 委托 / 选角 labels,
+        while 邮箱 remains plainly visible and is all this workflow needs to
+        start.  Keep the two-control form as the preferred signal, but do not
+        reject a valid mailbox-enabled town merely because those labels are
+        temporarily hidden by UI artwork or a guide banner.
+        """
+        _, window, boxes = self.wait_for_any(
+            {
+                state: ["委托", "选角"],
+                "mailbox-enabled town": ["邮箱"],
+            },
+            timeout,
+        )
+        return window, boxes
+
+    def leave_abyss_page_for_maintenance(
+        self,
+        title: str,
+        expected_states: dict[str, list[str]],
+    ) -> tuple[str, Window, list[TextBox]]:
+        """Click an Abyss page's real back arrow and verify the transition."""
+        fallback_points = (
+            self.ABYSS_BACK_POINT,
+            (0.022, 0.955),
+            (0.018, 0.94),
+        )
+        retry_offsets = (
+            (0.0, 0.0),
+            (0.004, -0.005),
+            (-0.004, -0.012),
+        )
+        last_error: TimeoutError | None = None
+        for attempt in range(1, 4):
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+            title_boxes = [
+                box
+                for box in find(title, boxes)
+                if box.center[0] < 0.30 and box.center[1] > 0.85
+            ]
+            if title_boxes:
+                anchor = max(title_boxes, key=lambda box: box.center[1])
+                # The arrow centre is about 2.3% of the window width left of
+                # the title. Preserve the OCR-derived vertical centre, then
+                # make each retry use a nearby point inside the same arrow.
+                base_x = max(0.012, anchor.x - 0.023)
+                offset_x, offset_y = retry_offsets[attempt - 1]
+                point = (base_x + offset_x, anchor.center[1] + offset_y)
+            else:
+                point = fallback_points[attempt - 1]
+            self.client.click(
+                window,
+                point,
+                f"back from {title} ({attempt}/3)",
+            )
+            try:
+                return self.wait_for_any(expected_states, timeout=10)
+            except TimeoutError as error:
+                last_error = error
+                print(f"{title} back click did not transition; retrying ({attempt}/3)")
+                time.sleep(0.4)
+        assert last_error is not None
+        raise last_error
+
     def return_from_abyss_pages_for_maintenance(self) -> None:
         """Leave the two Abyss pages before maintenance begins.
 
@@ -713,29 +788,41 @@ class AutoDNF:
                 self.CHARACTER_BOARD_CLOSE_POINT,
                 "close character selection before maintenance",
             )
-            self.wait_for(["委托", "选角"], "town before maintenance", timeout=20)
+            self.wait_for_maintenance_town("town before maintenance", timeout=20)
+            return
+
+        # 邮箱 is enough to begin maintenance.  This deliberately follows
+        # the modal-board check above: town controls can remain visible behind
+        # that board, but the board itself must be closed first.
+        if find("邮箱", boxes):
+            print("Maintenance is starting from mailbox-enabled town")
             return
 
         if find("普通秘境", boxes) and find("入场材料", boxes):
             print("Maintenance is starting from Normal Realm; returning to 时空秘境")
-            self.client.click(window, self.PAGE_BACK_POINT, "back from 普通秘境")
-            _, window, boxes = self.wait_for_any(
+            _, window, boxes = self.leave_abyss_page_for_maintenance(
+                "普通秘境",
                 {
                     "时空秘境 selector": ["时空秘境", "普通秘境"],
-                    "town": ["委托", "选角"],
+                    "town controls": ["委托", "选角"],
+                    "mailbox-enabled town": ["邮箱"],
                 },
-                timeout=15,
             )
 
         if not (exact("委托", boxes) and exact("选角", boxes)) and (
             find("时空秘境", boxes) and find("普通秘境", boxes)
         ):
             print("Maintenance is starting from 时空秘境; returning to town")
-            self.client.click(window, self.PAGE_BACK_POINT, "back from 时空秘境")
-            self.wait_for(["委托", "选角"], "town before maintenance", timeout=20)
+            self.leave_abyss_page_for_maintenance(
+                "时空秘境",
+                {
+                    "town before maintenance": ["委托", "选角"],
+                    "mailbox-enabled town": ["邮箱"],
+                },
+            )
             return
 
-        if exact("委托", boxes) and exact("选角", boxes):
+        if (exact("委托", boxes) and exact("选角", boxes)) or find("邮箱", boxes):
             return
         raise RuntimeError("Maintenance must start from town or an Abyss formation/selector page")
 
@@ -1317,7 +1404,7 @@ class AutoDNF:
             window, _ = self.wait_for([title], state, timeout=12)
             self.client.click(window, point, f"back from {title} ({attempt}/3)")
             try:
-                self.wait_for(["委托", "选角"], "town after page exit", timeout=12)
+                self.wait_for_maintenance_town("town after page exit", timeout=12)
                 return
             except TimeoutError as error:
                 last_error = error
@@ -1398,7 +1485,10 @@ class AutoDNF:
         reuse_current_if_first: bool = False,
     ) -> bool:
         """Choose the first unprocessed eligible character from the board."""
-        window, boxes = self.wait_for(["委托", "选角"], "town character controls", timeout=60)
+        window, boxes = self.wait_for_maintenance_town(
+            "town character controls",
+            timeout=60,
+        )
 
         # A real rift return panel lives in the far-right portion of the
         # window.  Do not mistake incidental "秘境传送口" text elsewhere in
@@ -1449,8 +1539,7 @@ class AutoDNF:
                     print("Character selection board finished rendering")
                     break
                 except TimeoutError:
-                    window, boxes = self.wait_for(
-                        ["委托", "选角"],
+                    window, boxes = self.wait_for_maintenance_town(
                         "town character controls",
                         timeout=8,
                     )
@@ -1477,9 +1566,32 @@ class AutoDNF:
         # scrolled view is necessarily below it. Keep that fact even after the
         # marker itself moves off-screen.
         passed_online_row = not bool(processed)
+        # macOS Vision occasionally alternates between a complete two-digit
+        # level and a dropped-leading/trailing-digit reading on an otherwise
+        # unchanged frame (for example 78/18 or 80/8). Retain the strongest
+        # plausible reading for each geometric slot while this view remains
+        # stationary. The evidence is cleared after every list scroll because
+        # a different character then occupies the same screen slot.
+        level_evidence: dict[int, int] = {}
+        initial_unreadable_retries = 0
         while True:
             frame = self.client.capture_png_bytes(window)
             rows = self.character_board_calibrated_rows(window, frame)
+            stabilized_rows: list[CharacterBoardRow] = []
+            for row in rows:
+                slot_key = round(row.click_y / 0.02)
+                if row.level is not None:
+                    level_evidence[slot_key] = max(
+                        row.level,
+                        level_evidence.get(slot_key, row.level),
+                    )
+                remembered_level = level_evidence.get(slot_key)
+                stabilized_rows.append(
+                    replace(row, level=remembered_level)
+                    if remembered_level is not None
+                    else row
+                )
+            rows = stabilized_rows
             if self.debug:
                 if rows:
                     values = ", ".join(
@@ -1495,9 +1607,14 @@ class AutoDNF:
                 row
                 for row in rows
                 if row.level is not None
-                and row.fatigue is not None
                 and row.level >= 75
-                and row.fatigue >= minimum_fatigue
+                and (
+                    minimum_fatigue == 0
+                    or (
+                        row.fatigue is not None
+                        and row.fatigue >= minimum_fatigue
+                    )
+                )
             ]
             initial_prefix_unreadable = False
             if not processed and available and initial_board_view:
@@ -1510,7 +1627,8 @@ class AutoDNF:
                 unreadable_before = [
                     row
                     for row in rows[:candidate_index]
-                    if row.level is None or row.fatigue is None
+                    if row.level is None
+                    or (minimum_fatigue > 0 and row.fatigue is None)
                 ]
                 if unreadable_before:
                     initial_prefix_unreadable = True
@@ -1523,7 +1641,8 @@ class AutoDNF:
                     available = []
             elif not processed and initial_board_view:
                 initial_prefix_unreadable = any(
-                    row.level is None or row.fatigue is None
+                    row.level is None
+                    or (minimum_fatigue > 0 and row.fatigue is None)
                     for row in rows
                 )
             if processed:
@@ -1568,25 +1687,35 @@ class AutoDNF:
                         self.CHARACTER_BOARD_CLOSE_POINT,
                         "close character selection board",
                     )
-                    self.wait_for(["委托", "选角"], "town after character-board close", timeout=15)
+                    self.wait_for_maintenance_town(
+                        "town after character-board close",
+                        timeout=15,
+                    )
                     return True
                 print(
                     f"Selecting first calibrated row with level {selected.level}, "
-                    f"{selected.fatigue}/100 fatigue"
+                    + (
+                        f"{selected.fatigue}/100 fatigue"
+                        if selected.fatigue is not None
+                        else "fatigue ignored for maintenance"
+                    )
                 )
                 if processed is not None:
                     processed.add(f"role-{len(processed) + 1}")
                 self.client.click(
                     window,
                     (0.45, selected.click_y),
-                    f"available character ({selected.fatigue}/100)",
+                    (
+                        f"available character ({selected.fatigue}/100)"
+                        if selected.fatigue is not None
+                        else "available maintenance character"
+                    ),
                 )
                 time.sleep(0.8)
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
                 self.click_right_button("开始游戏", window, boxes, "start selected character")
-                self.wait_for(
-                    ["委托", "选角"],
+                self.wait_for_maintenance_town(
                     "new character logged into town",
                     timeout=90,
                 )
@@ -1595,18 +1724,33 @@ class AutoDNF:
                 return True
 
             if initial_prefix_unreadable:
-                if time.monotonic() >= board_deadline:
+                initial_unreadable_retries += 1
+                if initial_unreadable_retries >= 8:
+                    # Do not spend the full board timeout rereading one bad
+                    # Vision frame. The row-local alternate candidates and
+                    # temporal evidence above have already had several
+                    # chances to recover it; continue the geometric traversal
+                    # so later rows can still be processed.
                     print(
-                        "Timed out reading the top character rows; the current "
-                        "在线 role was not reused because an earlier row could "
-                        "not be ruled out"
+                        "Top character-row level remained unreadable after "
+                        "8 focused scans; continuing downward exploration"
                     )
-                    return False
-                stable_empty_frames = 0
-                time.sleep(0.5)
-                window = self.client.find_window()
-                boxes = self.client.ocr(window)
-                continue
+                    initial_board_view = False
+                    initial_prefix_unreadable = False
+                    stable_empty_frames = 1
+                else:
+                    if time.monotonic() >= board_deadline:
+                        print(
+                            "Timed out reading the top character rows; the current "
+                            "在线 role was not reused because an earlier row could "
+                            "not be ruled out"
+                        )
+                        return False
+                    stable_empty_frames = 0
+                    time.sleep(0.5)
+                    window = self.client.find_window()
+                    boxes = self.client.ocr(window)
+                    continue
 
             if processed and not passed_online_row:
                 if time.monotonic() >= board_deadline:
@@ -1648,6 +1792,8 @@ class AutoDNF:
                     end=(0.50, 0.35 + self.CHARACTER_BOARD_ROW_PITCH),
                     label="character list downward",
                 )
+                level_evidence.clear()
+                initial_unreadable_retries = 0
                 # From this point on, incomplete OCR is a normal condition:
                 # use stable row geometry to keep exploring instead of
                 # repeatedly re-reading the same visible rows.
@@ -1748,6 +1894,17 @@ class AutoDNF:
                 if not boundaries or boundary - boundaries[-1] > pitch * 0.5:
                     boundaries.append(boundary)
             expected += pitch
+
+        # The first real row often begins a few pixels above PANEL.top.  In
+        # that case the phase search starts at the *second* row boundary and
+        # the fully visible first row is silently omitted. Reconstruct its
+        # clipped-by-calibration boundary from the fixed row pitch. This is
+        # safe only when the extrapolated point is close to the calibrated
+        # panel edge; arbitrary header lines cannot create an extra row.
+        if boundaries:
+            previous = boundaries[0] - pitch
+            if y0 - radius <= previous <= y0 + radius:
+                boundaries.insert(0, max(y0, previous))
 
         rows: list[tuple[float, float]] = []
         for top, bottom in zip(boundaries, boundaries[1:]):
@@ -1856,16 +2013,17 @@ class AutoDNF:
             # second, row-local pass before allowing a fresh-fatigue role to
             # be skipped at the bottom of the board.
             level = max(levels, default=None)
-            if level is None and fatigue is not None:
+            if (level is None or level < 75) and fatigue is not None:
                 badge_boxes = self.client.ocr_region(
                     window,
                     (
-                        0.06,
+                        0.075,
                         1.0 - (top + 0.98 * height),
-                        0.12,
+                        0.075,
                         0.78 * height,
                     ),
                     language_correction=False,
+                    candidate_count=5,
                 )
                 badge_levels = []
                 for box in badge_boxes:
@@ -1876,11 +2034,13 @@ class AutoDNF:
                     if match and 1 <= int(match.group(1)) <= 100:
                         badge_levels.append(int(match.group(1)))
                 if badge_levels:
-                    level = max(badge_levels)
-                    if self.debug:
+                    recovered_level = max(badge_levels)
+                    if level is None or recovered_level > level:
+                        level = recovered_level
+                    if self.debug and level >= 75:
                         print(
                             f"Recovered character-board level {level} "
-                            "with row-local badge OCR"
+                            "with row-local alternate-candidate OCR"
                         )
             result.append(
                 CharacterBoardRow(
