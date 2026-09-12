@@ -439,6 +439,113 @@ class AutoDNF:
         names = ", ".join(next_states)
         raise TimeoutError(f"{text} did not reach: {names}")
 
+    def open_mailbox_with_fast_retries(self) -> tuple[Window, list[TextBox]]:
+        """Open 邮箱 once per second, stopping after eight unchanged clicks.
+
+        Town can remain fully interactive while PlayCover drops an individual
+        mouse event.  The generic transition helper deliberately waits longer
+        for network-backed pages, but that makes this harmless town button
+        unnecessarily slow.  Here a retry is issued only when the town source
+        screen is still positively visible after one second. If the screen
+        enters an unknown loading state, wait for the mailbox instead of
+        clicking blindly into the changed UI.
+        """
+        click_count = 0
+        unresolved_frames = 0
+        mailbox_point: tuple[float, float] | None = None
+        window, boxes = self.wait_for(
+            ["委托", "邮箱"],
+            "town before mailbox",
+            timeout=12,
+        )
+        while click_count < 8:
+            if self.dismiss_known_activity_popup(window, boxes):
+                print("Dismissed activity popup; retrying 邮箱 without consuming an attempt")
+                window, boxes = self.wait_for(
+                    ["委托", "邮箱"],
+                    "town before mailbox",
+                    timeout=12,
+                )
+                continue
+
+            current_mailbox_point = self.town_mailbox_point(boxes)
+            if current_mailbox_point is not None:
+                mailbox_point = current_mailbox_point
+            if mailbox_point is None:
+                # OCR can briefly omit the small bottom-toolbar label. Refresh
+                # instead of passing the ambiguous result to click_from_boxes,
+                # which intentionally rejects duplicate/missing labels.
+                print("Town 邮箱 control is not OCR-visible; refreshing before retry")
+                time.sleep(1.0)
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                unresolved_frames += 1
+                if unresolved_frames >= 8:
+                    raise TimeoutError(
+                        "Town 邮箱 control was not visible in 8 consecutive OCR frames"
+                    )
+                continue
+            unresolved_frames = 0
+
+            click_count += 1
+            self.client.click(window, mailbox_point, f"邮箱 ({click_count}/8)")
+            time.sleep(1.0)
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+            if find("角色邮件", boxes):
+                print("Detected mailbox")
+                return window, boxes
+            if find("委托", boxes) and (
+                self.town_mailbox_point(boxes) is not None
+                or mailbox_point is not None
+            ):
+                print(f"邮箱 did not transition; retrying ({click_count}/8)")
+                continue
+
+            # Something did change, so another click at the old coordinate is
+            # unsafe. Give the in-flight page transition its normal allowance.
+            try:
+                return self.wait_for(["角色邮件"], "mailbox", timeout=12)
+            except TimeoutError:
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                if find("委托", boxes) and (
+                    self.town_mailbox_point(boxes) is not None
+                    or mailbox_point is not None
+                ):
+                    print(
+                        "Mailbox transition returned to town; resuming the "
+                        f"one-second retry loop ({click_count}/8)"
+                    )
+                    continue
+                raise
+
+        raise TimeoutError("邮箱 did not open after 8 one-second click attempts")
+
+    def town_mailbox_point(
+        self,
+        boxes: list[TextBox],
+    ) -> tuple[float, float] | None:
+        """Return the bottom-toolbar 邮箱 control, ignoring world labels.
+
+        Some towns render a second ``邮箱`` label beside the physical mailbox
+        NPC.  The toolbar control is consistently in the bottom quarter of the
+        PlayCover content window, so choosing the lowest matching box avoids
+        both the in-world label and the generic clicker's uniqueness failure.
+        """
+        choices = exact("邮箱", boxes) or find("邮箱", boxes)
+        toolbar_choices = [box for box in choices if box.center[1] <= 0.25]
+        if not toolbar_choices:
+            return None
+        chosen = min(toolbar_choices, key=lambda box: box.center[1])
+        if self.debug and len(choices) > 1:
+            print(
+                f"Detected {len(choices)} 邮箱 labels; using bottom town "
+                f"control at normalized ({chosen.center[0]:.3f}, "
+                f"{chosen.center[1]:.3f})"
+            )
+        return chosen.center
+
     def dismiss_known_activity_popup(self, window: Window, boxes: list[TextBox]) -> bool:
         """Close the known activity promotion only when its local OCR gate is present."""
         if self.in_dungeon or not self.client.execute:
@@ -623,6 +730,13 @@ class AutoDNF:
     def run_all_characters(self) -> None:
         """Run the dungeon, then rotate through every character with fatigue."""
         round_number = 1
+        window = self.client.find_window()
+        boxes = self.client.ocr(window)
+        if self.can_resume_dungeon(boxes):
+            print("Already in a dungeon; resuming battle before character rotation")
+            self.in_dungeon = True
+            self.run_battle(start_by_entering=False)
+            round_number += 1
         while True:
             current_fatigue = self.wait_for_town_fatigue()
             if current_fatigue is None:
@@ -652,6 +766,23 @@ class AutoDNF:
                 print("No eligible party companion remained. Automation complete.")
                 return
             round_number += 1
+
+    @staticmethod
+    def can_resume_dungeon(boxes: list[TextBox]) -> bool:
+        """Recognize an active room or boss results, not a ready formation."""
+        if any(find(text, boxes) for text in (
+            "入场", "编队完成", "选择冒险团角色", "挑战进度", "一键制作",
+        )):
+            return False
+        retry, settlement = AutoDNF.boss_result_action_buttons(boxes)
+        if retry or settlement:
+            return True
+        # The map name is in the upper-right HUD. Fatigue labels alone also
+        # occur on party/character screens and must not trigger battle input.
+        return any(
+            box.center[0] > 0.70 and box.center[1] > 0.80
+            for box in find("秘境：", boxes)
+        )
 
     def run_mail_maintenance_all(self) -> None:
         """Claim character mail and dismantle equipment for every eligible role once."""
@@ -798,7 +929,11 @@ class AutoDNF:
             print("Maintenance is starting from mailbox-enabled town")
             return
 
-        if find("普通秘境", boxes) and find("入场材料", boxes):
+        if find("普通秘境", boxes) and (
+            find("入场材料", boxes)
+            or find("黑钻免费入场", boxes)
+            or exact("入场", boxes)
+        ):
             print("Maintenance is starting from Normal Realm; returning to 时空秘境")
             _, window, boxes = self.leave_abyss_page_for_maintenance(
                 "普通秘境",
@@ -828,15 +963,7 @@ class AutoDNF:
 
     def receive_all_character_mail(self) -> bool:
         """Open character mail, claim all mail when present, then return to town."""
-        self.click_then_wait(
-            "邮箱",
-            "town before mailbox",
-            ["委托", "邮箱"],
-            {"mailbox": ["角色邮件"]},
-            post_click_delay=0.45,
-            retry_source_timeout=1.5,
-        )
-        window, boxes = self.wait_for(["角色邮件"], "mailbox", timeout=15)
+        window, boxes = self.open_mailbox_with_fast_retries()
         skip_character = bool(find("背包已满", boxes))
         if skip_character:
             print("Detected 背包已满 in mailbox; leaving this character untouched")
@@ -1399,12 +1526,27 @@ class AutoDNF:
             (0.04, 0.96),
             (0.045, 0.92),
         )
+        max_attempts = 8 if title == "邮箱" else 3
         last_error: TimeoutError | None = None
-        for attempt, point in enumerate(back_points, start=1):
+        for attempt in range(1, max_attempts + 1):
+            point = back_points[(attempt - 1) % len(back_points)]
             window, _ = self.wait_for([title], state, timeout=12)
-            self.client.click(window, point, f"back from {title} ({attempt}/3)")
+            self.client.click(window, point, f"back from {title} ({attempt}/{max_attempts})")
             try:
-                self.wait_for_maintenance_town("town after page exit", timeout=12)
+                if title == "邮箱":
+                    time.sleep(1.0)
+                    window = self.client.find_window()
+                    boxes = self.client.ocr(window)
+                    # The mailbox page itself contains 邮箱 in its header;
+                    # that text alone cannot prove the back click succeeded.
+                    town_visible = (
+                        exact("委托", boxes) and exact("选角", boxes)
+                    ) or self.town_mailbox_point(boxes) is not None
+                    if find("角色邮件", boxes) or not town_visible:
+                        raise TimeoutError("Mailbox back click did not return to town")
+                    print("Detected town after page exit")
+                else:
+                    self.wait_for_maintenance_town("town after page exit", timeout=12)
                 return
             except TimeoutError as error:
                 last_error = error
@@ -1414,8 +1556,10 @@ class AutoDNF:
                     # The page did close.  Do not fire a second top-left click
                     # into an unknown town overlay; surface the actual state.
                     raise
-                print(f"{title} back click did not transition; retrying ({attempt}/3)")
-                time.sleep(0.6)
+                if attempt < max_attempts:
+                    print(f"{title} back click did not transition; retrying ({attempt}/{max_attempts})")
+                    if title != "邮箱":
+                        time.sleep(0.6)
         assert last_error is not None
         raise last_error
 
@@ -2095,7 +2239,10 @@ class AutoDNF:
             "普通秘境",
             "realm selection",
             ["普通秘境", "时空秘境"],
-            {"party setup": ["普通秘境", "入场材料"]},
+            {
+                "party setup": ["普通秘境", "入场材料"],
+                "free-entry party setup": ["普通秘境", "黑钻免费入场"],
+            },
         )
         if not self.configure_party():
             return False
@@ -2503,6 +2650,20 @@ class AutoDNF:
             return False
         for attempt in range(1, 4):
             if not self.click_fresh_party_complete(f"编队完成 ({attempt}/3)"):
+                # A successful first click can close the picker before the
+                # next OCR pass. In that state 编队完成 correctly has zero
+                # matches; treat the visible 入场 screen as success instead
+                # of exhausting retries for a button that no longer exists.
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                if (
+                    exact("入场", boxes)
+                    and self.visible_party_member_count(boxes) >= 2
+                    and not exact("选择冒险团角色", boxes)
+                    and not exact("编队完成", boxes)
+                ):
+                    print("编队完成 already closed the picker; detected ready formation")
+                    return self.verify_complete_party_formation()
                 time.sleep(0.6)
                 continue
             time.sleep(0.8)
@@ -2513,7 +2674,7 @@ class AutoDNF:
             for _ in range(3):
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
-                if find("选择冒险团角色", boxes):
+                if exact("选择冒险团角色", boxes) or exact("编队完成", boxes):
                     picker_absent_frames = 0
                     break
                 picker_absent_frames += 1
@@ -2553,7 +2714,11 @@ class AutoDNF:
         while time.monotonic() < deadline:
             window = self.client.find_window()
             boxes = self.client.ocr(window)
-            if not find("普通秘境", boxes):
+            if (
+                not exact("入场", boxes)
+                or exact("选择冒险团角色", boxes)
+                or exact("编队完成", boxes)
+            ):
                 time.sleep(0.35)
                 continue
             highest_count = max(highest_count, self.visible_party_member_count(boxes))
@@ -2596,7 +2761,9 @@ class AutoDNF:
             # completed party formation that is waiting at the 入场 button.
             window = self.client.find_window()
             boxes = self.client.ocr(window)
-            if find("入场材料", boxes) and exact("入场", boxes):
+            if exact("入场", boxes) and (
+                find("入场材料", boxes) or find("黑钻免费入场", boxes)
+            ):
                 self.enter_dungeon()
         deadline = time.monotonic() + 60 * 60
         town_frames = 0
@@ -2739,7 +2906,7 @@ class AutoDNF:
         # 入场 is required to consume the newly made materials. Network/UI
         # input can also drop an entry click, so permit three total attempts.
         for attempt in range(1, 4):
-            window, boxes = self.wait_for(["入场", "入场材料"], "ready formation")
+            window, boxes = self.wait_for(["入场"], "ready formation")
             self.click_fresh_entry_button(f"entry ({attempt}/3)")
             try:
                 state, window, boxes = self.wait_for_any(
@@ -3271,8 +3438,13 @@ class AutoDNF:
         if not keypad_closed:
             raise TimeoutError("Maximum entry-material quantity keypad did not close")
 
-        if not find("一键制作", boxes):
-            window, boxes = self.wait_for(["一键制作"], "entry material craft dialog", timeout=5)
+        # Reaching this point already proves that the uniquely identified
+        # quantity keypad opened and then closed after our 输入 click.  Do not
+        # require OCR to rediscover 一键制作: the global scrolling announcement
+        # commonly crosses that title while the underlying dialog is fully
+        # rendered and ready. Refresh the window so the fixed confirmation
+        # point is applied to the current frame.
+        window = self.client.find_window()
 
         self.client.click(window, self.ENTRY_CRAFT_CONFIRM, "confirm maximum entry material craft")
         # The crafting animation promotes a second foreground confirmation
