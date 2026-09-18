@@ -25,6 +25,10 @@ def exact(text: str, boxes: list[TextBox]) -> list[TextBox]:
     return [box for box in boxes if box.normalized == target]
 
 
+class CurrentCharacterFatigueExhausted(RuntimeError):
+    """The crowned main role cannot pay the dungeon fatigue cost."""
+
+
 @dataclass(frozen=True)
 class CharacterBoardRow:
     """One fully visible, geometry-calibrated character-board row."""
@@ -42,7 +46,21 @@ class AutoDNF:
     # harmless close X. Its text is used as the required local gate; the click
     # never happens for an arbitrary unrecognised overlay.
     ACTIVITY_POPUP_TEXTS = ("活动角色福利", "前往指定活动角色")
-    ACTIVITY_POPUP_CLOSE = (0.94, 0.85)
+    ACTIVITY_POPUP_CLOSE = (0.947, 0.907)
+    # Full-screen tournament promotion that can appear immediately after a
+    # character login. Its bottom caption is reliably OCR-visible even when
+    # the stylised central headline is not.
+    TOURNAMENT_POPUP_TEXTS = ("全国格斗大赛秋季赛", "格斗大赛秋季赛")
+    TOURNAMENT_POPUP_CLOSE = (0.93, 0.92)
+    # Post-login level-boost promotion. It has no close X, so it is dismissed
+    # with the physical Escape key only after multiple artwork-specific labels
+    # agree.
+    LEVEL_BOOST_POPUP_TEXTS = (
+        "3分钟直升15万",
+        "全能黄金胶囊",
+        "本角色已使用",
+        "查看更多活动",
+    )
     # PlayCover's keyboard-control tutorial can appear after logging into
     # town. Its artwork/pages vary, but these title labels and the title-bar X
     # are stable.
@@ -235,6 +253,12 @@ class AutoDNF:
             # action. Dismiss it immediately rather than waiting for the
             # current state timeout and sending an unnecessary cloud request.
             if self.dismiss_known_activity_popup(window, boxes):
+                delay = 0.4
+                continue
+            if self.dismiss_known_tournament_popup(window, boxes):
+                delay = 0.4
+                continue
+            if self.dismiss_known_level_boost_popup(window, boxes):
                 delay = 0.4
                 continue
             if self.dismiss_known_keyboard_guide_popup(window, boxes):
@@ -557,6 +581,44 @@ class AutoDNF:
         time.sleep(0.8)
         return True
 
+    def dismiss_known_tournament_popup(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Close the post-login tournament advertisement at its fixed X."""
+        if self.in_dungeon or not self.client.execute:
+            return False
+        if not any(find(text, boxes) for text in self.TOURNAMENT_POPUP_TEXTS):
+            return False
+        print("Detected tournament advertisement; clicking its close X")
+        self.client.click(
+            window,
+            self.TOURNAMENT_POPUP_CLOSE,
+            "close tournament advertisement",
+        )
+        time.sleep(0.8)
+        return True
+
+    def dismiss_known_level_boost_popup(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Dismiss the uniquely identified post-login level-boost page."""
+        if self.in_dungeon or not self.client.execute:
+            return False
+        visible = sum(
+            bool(find(text, boxes))
+            for text in self.LEVEL_BOOST_POPUP_TEXTS
+        )
+        if visible < 2:
+            return False
+        print("Detected level-boost advertisement; pressing ESC")
+        self.client.press_escape()
+        time.sleep(0.8)
+        return True
+
     def dismiss_known_keyboard_guide_popup(
         self,
         window: Window,
@@ -695,13 +757,16 @@ class AutoDNF:
         return True
 
     def run_to_party(self, battle: bool = False) -> bool:
-        self.click_then_wait(
+        commission_state, _, _ = self.click_then_wait(
             "委托",
             "main screen",
             ["委托"],
-            {"commission board": ["深渊：时空秘境"]},
+            {
+                "commission categories": ["委托布告栏", "日常地下城"],
+                "commission board": ["深渊：时空秘境"],
+            },
         )
-        state = self.open_rift_commission()
+        state = self.open_rift_commission(commission_state)
         if state == "travel confirmation":
             state = self.confirm_travel()
         if state == "时空秘境 town":
@@ -714,13 +779,16 @@ class AutoDNF:
         if state == "时空秘境 town":
             # The game sometimes teleports first, then requires the same
             # commission to be opened again from the destination town.
-            self.click_then_wait(
+            commission_state, _, _ = self.click_then_wait(
                 "委托",
                 "时空秘境 town",
                 ["委托"],
-                {"commission board": ["深渊：时空秘境"]},
+                {
+                    "commission categories": ["委托布告栏", "日常地下城"],
+                    "commission board": ["深渊：时空秘境"],
+                },
             )
-            state = self.open_rift_commission()
+            state = self.open_rift_commission(commission_state)
             if state == "travel confirmation":
                 state = self.confirm_travel()
         if state != "realm selection":
@@ -762,7 +830,16 @@ class AutoDNF:
                 continue
             print(f"Current character has {current_fatigue}/100 fatigue; continuing to 委托")
             print(f"Starting character round {round_number}")
-            if not self.run_to_party(battle=True):
+            try:
+                party_ready = self.run_to_party(battle=True)
+            except CurrentCharacterFatigueExhausted:
+                print(
+                    "Current main character has insufficient fatigue at the "
+                    "formation screen; returning to town to switch roles"
+                )
+                self.return_from_abyss_pages_for_maintenance()
+                continue
+            if not party_ready:
                 print("No eligible party companion remained. Automation complete.")
                 return
             round_number += 1
@@ -2266,7 +2343,17 @@ class AutoDNF:
         )
         return "realm selection"
 
-    def open_rift_commission(self) -> str:
+    def open_rift_commission(self, board_state: str = "commission board") -> str:
+        if board_state == "commission categories":
+            # 日常地下城 moved from the first category row to the second. Use
+            # its freshly detected OCR box so the click follows the current
+            # row position at every supported window size.
+            self.click_then_wait(
+                "日常地下城",
+                "commission categories",
+                ["委托布告栏", "日常地下城"],
+                {"commission board": ["深渊：时空秘境"]},
+            )
         next_states = {
             "travel confirmation": ["提示", "时空秘境城镇"],
             "realm selection (normal)": ["时空秘境", "普通秘境"],
@@ -2303,6 +2390,7 @@ class AutoDNF:
         current_fatigue: int | None = None
         while True:
             window, boxes = self.wait_for(["普通秘境"], "party setup", timeout=6)
+            self.require_current_character_fatigue(boxes)
             fatigue_readings = [
                 (box, int(match.group(1)))
                 for box in boxes
@@ -2721,6 +2809,7 @@ class AutoDNF:
             ):
                 time.sleep(0.35)
                 continue
+            self.require_current_character_fatigue(boxes)
             highest_count = max(highest_count, self.visible_party_member_count(boxes))
             if highest_count >= 2:
                 print("Party formation saved with current role and companion")
@@ -2731,6 +2820,31 @@ class AutoDNF:
             "stopping before dungeon entry"
         )
         return False
+
+    @staticmethod
+    def current_formation_fatigue(boxes: list[TextBox]) -> int | None:
+        """Read fatigue from the crowned middle card on the formation page."""
+        readings: list[tuple[float, int]] = []
+        for box in boxes:
+            match = re.fullmatch(r"([0-9]{1,3})/100", box.normalized)
+            if not match or not (0.52 < box.center[0] < 0.80):
+                continue
+            value = int(match.group(1))
+            if 0 <= value <= 100:
+                readings.append((abs(box.center[0] - 0.68), value))
+        return min(readings)[1] if readings else None
+
+    def require_current_character_fatigue(self, boxes: list[TextBox]) -> None:
+        """Reject a formation whose crowned main role has under 10 fatigue."""
+        fatigue = self.current_formation_fatigue(boxes)
+        central_warning = any(
+            0.52 < box.center[0] < 0.80
+            for box in find("疲劳值不足", boxes)
+        )
+        if (fatigue is not None and fatigue < 10) or central_warning:
+            detail = f"{fatigue}/100" if fatigue is not None else "疲劳值不足"
+            print(f"Detected exhausted crowned main character: {detail}")
+            raise CurrentCharacterFatigueExhausted(detail)
 
     def click_fresh_party_complete(self, label: str) -> bool:
         """Locate 编队完成 in the latest picker frame before clicking it."""
@@ -2907,6 +3021,7 @@ class AutoDNF:
         # input can also drop an entry click, so permit three total attempts.
         for attempt in range(1, 4):
             window, boxes = self.wait_for(["入场"], "ready formation")
+            self.require_current_character_fatigue(boxes)
             self.click_fresh_entry_button(f"entry ({attempt}/3)")
             try:
                 state, window, boxes = self.wait_for_any(
