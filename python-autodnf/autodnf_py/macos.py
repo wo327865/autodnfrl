@@ -17,7 +17,6 @@ from Quartz import (
     CGEventCreateMouseEvent,
     CGEventSourceKeyState,
     CGEventPost,
-    CGEventPostToPid,
     CGWindowListCopyWindowInfo,
     kCGHIDEventTap,
     kCGMouseButtonLeft,
@@ -131,8 +130,6 @@ class GlobalStopShortcut:
 
 
 class MacClient:
-    ESCAPE_KEYCODE = 53
-
     def __init__(self, hint: str = "地下城与勇士", execute: bool = False) -> None:
         self.hint = hint.lower()
         self.execute = execute
@@ -470,29 +467,6 @@ class MacClient:
             time.sleep(duration)
         finally:
             CGEventPost(kCGHIDEventTap, up)
-
-    def press_escape(self) -> None:
-        """Send Escape directly to the PlayCover process.
-
-        A session-wide synthetic ESC can be dropped immediately after a role
-        switch even though the window was activated. Targeting the owning PID
-        mirrors a focused keyboard event without relying on global dispatch.
-        """
-        if not self.execute:
-            print("[dry-run] press ESC")
-            return
-        window = self.find_window()
-        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(window.pid)
-        if app:
-            app.activateWithOptions_(1)
-            time.sleep(0.25)
-        down = CGEventCreateKeyboardEvent(None, self.ESCAPE_KEYCODE, True)
-        up = CGEventCreateKeyboardEvent(None, self.ESCAPE_KEYCODE, False)
-        CGEventPostToPid(window.pid, down)
-        try:
-            time.sleep(0.18)
-        finally:
-            CGEventPostToPid(window.pid, up)
 
     def hold(self, keycodes: Iterable[int], duration: float) -> None:
         keys = list(keycodes)

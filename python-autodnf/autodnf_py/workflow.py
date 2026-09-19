@@ -52,15 +52,15 @@ class AutoDNF:
     # the stylised central headline is not.
     TOURNAMENT_POPUP_TEXTS = ("全国格斗大赛秋季赛", "格斗大赛秋季赛")
     TOURNAMENT_POPUP_CLOSE = (0.93, 0.92)
-    # Post-login level-boost promotion. It has no close X, so it is dismissed
-    # with the physical Escape key only after multiple artwork-specific labels
-    # agree.
+    # Post-login level-boost promotion. Its close control is the glowing X in
+    # the upper-right artwork, calibrated in window-normalized coordinates.
     LEVEL_BOOST_POPUP_TEXTS = (
         "3分钟直升15万",
         "全能黄金胶囊",
         "本角色已使用",
         "查看更多活动",
     )
+    LEVEL_BOOST_POPUP_CLOSE = (0.884, 0.895)
     # PlayCover's keyboard-control tutorial can appear after logging into
     # town. Its artwork/pages vary, but these title labels and the title-bar X
     # are stable.
@@ -237,31 +237,7 @@ class AutoDNF:
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             last_window, last_boxes = window, boxes
-            if self.dismiss_known_special_signin_popup(window, boxes):
-                delay = 0.4
-                continue
-            if self.dismiss_known_rift_reward_mail_popup(window, boxes):
-                delay = 0.4
-                continue
-            if self.dismiss_known_guild_signin_popup(window, boxes):
-                delay = 0.4
-                continue
-            if self.dismiss_known_epic_stone_popup(window, boxes):
-                delay = 0.4
-                continue
-            # A known town activity promotion can appear before any workflow
-            # action. Dismiss it immediately rather than waiting for the
-            # current state timeout and sending an unnecessary cloud request.
-            if self.dismiss_known_activity_popup(window, boxes):
-                delay = 0.4
-                continue
-            if self.dismiss_known_tournament_popup(window, boxes):
-                delay = 0.4
-                continue
-            if self.dismiss_known_level_boost_popup(window, boxes):
-                delay = 0.4
-                continue
-            if self.dismiss_known_keyboard_guide_popup(window, boxes):
+            if self.dismiss_known_blocking_popup(window, boxes):
                 delay = 0.4
                 continue
             for state, texts in states.items():
@@ -440,8 +416,8 @@ class AutoDNF:
         """
         for attempt in range(1, retries + 1):
             window, boxes = self.wait_for(source_texts, source_state)
-            if self.dismiss_known_activity_popup(window, boxes):
-                print("Dismissed activity popup; retrying the original action")
+            if self.dismiss_known_blocking_popup(window, boxes):
+                print("Dismissed blocking popup; retrying the original action")
                 continue
             self.click_from_boxes(text, window, boxes, f"{text} ({attempt}/{retries})")
             time.sleep(post_click_delay)
@@ -483,8 +459,8 @@ class AutoDNF:
             timeout=12,
         )
         while click_count < 8:
-            if self.dismiss_known_activity_popup(window, boxes):
-                print("Dismissed activity popup; retrying 邮箱 without consuming an attempt")
+            if self.dismiss_known_blocking_popup(window, boxes):
+                print("Dismissed blocking popup; retrying 邮箱 without consuming an attempt")
                 window, boxes = self.wait_for(
                     ["委托", "邮箱"],
                     "town before mailbox",
@@ -519,6 +495,22 @@ class AutoDNF:
             if find("角色邮件", boxes):
                 print("Detected mailbox")
                 return window, boxes
+            if self.dismiss_known_blocking_popup(window, boxes):
+                # The click was intercepted by a delayed post-login overlay,
+                # not dropped by the mailbox control. Reacquire the town UI
+                # and refund this attempt before clicking 邮箱 again.
+                click_count -= 1
+                print(
+                    "Delayed popup intercepted 邮箱; retrying without "
+                    "consuming an attempt"
+                )
+                window, boxes = self.wait_for(
+                    ["委托", "邮箱"],
+                    "town before mailbox",
+                    timeout=12,
+                )
+                mailbox_point = None
+                continue
             if find("委托", boxes) and (
                 self.town_mailbox_point(boxes) is not None
                 or mailbox_point is not None
@@ -570,6 +562,24 @@ class AutoDNF:
             )
         return chosen.center
 
+    def dismiss_known_blocking_popup(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Dismiss one locally identified overlay before evaluating page state."""
+        handlers = (
+            self.dismiss_known_special_signin_popup,
+            self.dismiss_known_rift_reward_mail_popup,
+            self.dismiss_known_guild_signin_popup,
+            self.dismiss_known_epic_stone_popup,
+            self.dismiss_known_activity_popup,
+            self.dismiss_known_tournament_popup,
+            self.dismiss_known_level_boost_popup,
+            self.dismiss_known_keyboard_guide_popup,
+        )
+        return any(handler(window, boxes) for handler in handlers)
+
     def dismiss_known_activity_popup(self, window: Window, boxes: list[TextBox]) -> bool:
         """Close the known activity promotion only when its local OCR gate is present."""
         if self.in_dungeon or not self.client.execute:
@@ -614,8 +624,12 @@ class AutoDNF:
         )
         if visible < 2:
             return False
-        print("Detected level-boost advertisement; pressing ESC")
-        self.client.press_escape()
+        print("Detected level-boost advertisement; clicking its close X")
+        self.client.click(
+            window,
+            self.LEVEL_BOOST_POPUP_CLOSE,
+            "close level-boost advertisement",
+        )
         time.sleep(0.8)
         return True
 
@@ -1327,13 +1341,7 @@ class AutoDNF:
                 timeout=15,
                 stable_frames=2,
             )
-            self.click_template(window, open_match, "open dismantle panel")
-            self.wait_for_template_any(
-                ("dismantle_empty", "dismantle_ready"),
-                "inventory dismantle panel",
-                timeout=15,
-                stable_frames=2,
-            )
+            self.open_dismantle_panel_with_retries(window, open_match)
             print("Using fixed-position image templates for dismantle workflow")
             self.dismantle_all_available_equipment_by_template()
             return
@@ -1564,6 +1572,71 @@ class AutoDNF:
         scores = self.template_matcher.scores(screenshot, names)
         details = ", ".join(f"{name}={scores[name]:.3f}" for name in names)
         raise TimeoutError(f"Timed out waiting for template state {state}: {details}")
+
+    def open_dismantle_panel_with_retries(
+        self,
+        window: Window,
+        open_match: TemplateMatch,
+    ) -> tuple[Window, TemplateMatch]:
+        """Open the dismantle panel with eight verified one-second retries."""
+        if self.template_matcher is None:
+            raise RuntimeError("Fixed template matcher is not configured")
+        panel_names = ("dismantle_empty", "dismantle_ready")
+        last_screenshot: bytes | None = None
+        for attempt in range(1, 9):
+            self.click_template(
+                window,
+                open_match,
+                f"open dismantle panel ({attempt}/8)",
+            )
+            time.sleep(1.0)
+            window = self.client.find_window()
+            last_screenshot = self.client.capture_png_bytes(window)
+
+            for name in panel_names:
+                panel_match = self.template_matcher.match(last_screenshot, name)
+                if panel_match is not None:
+                    print(
+                        "Template detected inventory dismantle panel: "
+                        f"{panel_match.name} ({panel_match.score:.3f})"
+                    )
+                    return window, panel_match
+
+            still_open = self.template_matcher.match(
+                last_screenshot,
+                "dismantle_open",
+            )
+            if still_open is not None:
+                open_match = still_open
+                if attempt < 8:
+                    print(
+                        "Dismantle panel did not open; retrying "
+                        f"({attempt}/8)"
+                    )
+                continue
+
+            # The normal button disappeared, so the UI is changing. Wait for
+            # a known panel state rather than clicking the old coordinate.
+            try:
+                return self.wait_for_template_any(
+                    panel_names,
+                    "inventory dismantle panel after transition",
+                    timeout=4,
+                    stable_frames=2,
+                )
+            except TimeoutError as error:
+                raise TimeoutError(
+                    "Dismantle button disappeared after click, but no known "
+                    "panel state finished rendering"
+                ) from error
+
+        assert last_screenshot is not None
+        scores = self.template_matcher.scores(last_screenshot, panel_names)
+        details = ", ".join(f"{name}={scores[name]:.3f}" for name in panel_names)
+        raise TimeoutError(
+            "Dismantle panel did not open after 8 one-second click attempts: "
+            f"{details}"
+        )
 
     def click_template(self, window: Window, match: TemplateMatch, label: str) -> None:
         point = match.click_point_vision

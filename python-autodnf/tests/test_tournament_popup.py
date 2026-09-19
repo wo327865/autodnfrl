@@ -64,17 +64,21 @@ class TournamentPopupTests(unittest.TestCase):
         sleep.assert_called_once_with(0.8)
 
     @patch("autodnf_py.workflow.time.sleep")
-    def test_dismisses_level_boost_ad_with_escape(self, sleep):
+    def test_closes_level_boost_ad_at_calibrated_x(self, sleep):
         flow = self.make_flow()
+        window = object()
         boxes = [
             TextBox("3分钟直升15万", 0.35, 0.75, 0.3, 0.08),
             TextBox("全能黄金胶囊", 0.65, 0.55, 0.2, 0.04),
             TextBox("本角色已使用", 0.40, 0.30, 0.2, 0.04),
         ]
 
-        self.assertTrue(flow.dismiss_known_level_boost_popup(object(), boxes))
-        flow.client.press_escape.assert_called_once_with()
-        flow.client.click.assert_not_called()
+        self.assertTrue(flow.dismiss_known_level_boost_popup(window, boxes))
+        flow.client.click.assert_called_once_with(
+            window,
+            (0.884, 0.895),
+            "close level-boost advertisement",
+        )
         sleep.assert_called_once_with(0.8)
 
     def test_level_boost_ad_requires_two_unique_markers(self):
@@ -82,7 +86,7 @@ class TournamentPopupTests(unittest.TestCase):
         boxes = [TextBox("查看更多活动", 0.6, 0.1, 0.2, 0.04)]
 
         self.assertFalse(flow.dismiss_known_level_boost_popup(object(), boxes))
-        flow.client.press_escape.assert_not_called()
+        flow.client.click.assert_not_called()
 
 
 if __name__ == "__main__":
