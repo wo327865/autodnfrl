@@ -10,11 +10,28 @@ def box(text, x=0.4, y=0.4):
 
 
 class RunAllResumeTests(unittest.TestCase):
+    def test_character_selection_button_retries_eight_times(self):
+        flow = AutoDNF.__new__(AutoDNF)
+        flow.client = Mock()
+        window = object()
+        flow.wait_for_maintenance_town = Mock(return_value=(window, []))
+        flow.wait_for_character_selection_board = Mock(
+            side_effect=TimeoutError("selection board not ready")
+        )
+
+        self.assertFalse(flow.switch_to_available_character())
+        self.assertEqual(flow.client.click.call_count, 8)
+        self.assertEqual(
+            [call.args[2] for call in flow.client.click.call_args_list],
+            [f"character selection ({attempt}/8)" for attempt in range(1, 9)],
+        )
+
     def test_active_room_and_boss_results(self):
         for boxes in (
             [box("秘境：侵蚀之地", 0.85, 0.92)],
             [box("再次挑战", 0.84, 0.8)],
             [box("领奖结算", 0.84, 0.7)],
+            [box("100/100", 0.08, 0.70), box("80/100", 0.08, 0.58)],
         ):
             self.assertTrue(AutoDNF.can_resume_dungeon(boxes))
 
@@ -26,8 +43,21 @@ class RunAllResumeTests(unittest.TestCase):
             [box("挑战进度"), box("100/100")],
             [box("秘境：侵蚀之地", 0.2, 0.4)],
             [box("再次挑战", 0.2, 0.4)],
+            [box("100/100", 0.08, 0.70)],
         ):
             self.assertFalse(AutoDNF.can_resume_dungeon(boxes))
+
+    def test_startup_probe_survives_one_unreadable_frame(self):
+        flow = AutoDNF.__new__(AutoDNF)
+        flow.client = Mock()
+        flow.client.ocr.side_effect = [
+            [],
+            [box("0/100", 0.08, 0.70), box("50/100", 0.08, 0.58)],
+        ]
+
+        with unittest.mock.patch("autodnf_py.workflow.time.sleep"):
+            self.assertTrue(flow.starts_in_active_dungeon())
+        self.assertEqual(flow.client.ocr.call_count, 2)
 
     def test_resume_before_town_rotation_without_entering_again(self):
         flow = AutoDNF.__new__(AutoDNF)

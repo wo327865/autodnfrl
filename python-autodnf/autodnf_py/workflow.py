@@ -110,6 +110,8 @@ class AutoDNF:
     # window.  0.82 lands just below its lower edge and can be intercepted by
     # the quest panel after a dungeon run.
     CHARACTER_SELECT_POINT = (0.04, 0.85)
+    CHARACTER_SELECT_RETRIES = 8
+    DUNGEON_ENTRY_RETRIES = 8
     # The 挑战进度 board's X is lower than a standard dialog title-bar X.
     CHARACTER_BOARD_CLOSE_POINT = (0.94, 0.87)
     # Calibrated from 2956x1718 window-only captures. Coordinates below use a
@@ -812,9 +814,7 @@ class AutoDNF:
     def run_all_characters(self) -> None:
         """Run the dungeon, then rotate through every character with fatigue."""
         round_number = 1
-        window = self.client.find_window()
-        boxes = self.client.ocr(window)
-        if self.can_resume_dungeon(boxes):
+        if self.starts_in_active_dungeon():
             print("Already in a dungeon; resuming battle before character rotation")
             self.in_dungeon = True
             self.run_battle(start_by_entering=False)
@@ -868,12 +868,51 @@ class AutoDNF:
         retry, settlement = AutoDNF.boss_result_action_buttons(boxes)
         if retry or settlement:
             return True
+        left_party_fatigue = [
+            box
+            for box in boxes
+            if re.fullmatch(r"[0-9]{1,3}/100", box.normalized)
+            and box.center[0] < 0.30
+            and 0.10 < box.center[1] < 0.82
+        ]
+        if len(left_party_fatigue) >= 2:
+            return True
         # The map name is in the upper-right HUD. Fatigue labels alone also
         # occur on party/character screens and must not trigger battle input.
         return any(
             box.center[0] > 0.70 and box.center[1] > 0.80
-            for box in find("秘境：", boxes)
+            for box in find("秘境", boxes)
         )
+
+    def starts_in_active_dungeon(self, timeout: float = 6.0) -> bool:
+        """Probe startup frames until dungeon or stable town UI is recognized."""
+        deadline = time.monotonic() + timeout
+        while True:
+            window = self.client.find_window()
+            boxes = self.client.ocr(window)
+            if self.can_resume_dungeon(boxes):
+                return True
+
+            town_visible = bool(exact("委托", boxes)) and (
+                bool(find("选角", boxes))
+                or self.town_mailbox_point(boxes) is not None
+                or bool(exact("背包", boxes))
+            )
+            known_non_dungeon = town_visible or any(
+                find(text, boxes)
+                for text in (
+                    "入场材料",
+                    "黑钻免费入场",
+                    "选择冒险团角色",
+                    "挑战进度",
+                    "委托布告栏",
+                )
+            )
+            if known_non_dungeon:
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
 
     def run_mail_maintenance_all(self) -> None:
         """Claim character mail and dismantle equipment for every eligible role once."""
@@ -1814,11 +1853,11 @@ class AutoDNF:
                 print(f"Rift-town panel is still open; retrying ({rift_dismissals}/3)")
                 continue
 
-        for attempt in range(1, 4):
+        for attempt in range(1, self.CHARACTER_SELECT_RETRIES + 1):
             self.client.click(
                 window,
                 self.CHARACTER_SELECT_POINT,
-                f"character selection ({attempt}/3)",
+                f"character selection ({attempt}/{self.CHARACTER_SELECT_RETRIES})",
             )
             try:
                 window, boxes = self.wait_for_character_selection_board(timeout=12)
@@ -1837,9 +1876,15 @@ class AutoDNF:
                         "town character controls",
                         timeout=8,
                     )
-                print(f"Character selection did not open; retrying ({attempt}/3)")
+                print(
+                    "Character selection did not open; retrying "
+                    f"({attempt}/{self.CHARACTER_SELECT_RETRIES})"
+                )
         else:
-            print("Character selection did not open after three safe recovery attempts")
+            print(
+                "Character selection did not open after "
+                f"{self.CHARACTER_SELECT_RETRIES} safe recovery attempts"
+            )
             return False
 
         if reset_to_top or (
@@ -3091,11 +3136,13 @@ class AutoDNF:
         """Enter the dungeon, crafting missing entry materials once if needed."""
         # A successful 一键制作 returns to this formation page; re-clicking
         # 入场 is required to consume the newly made materials. Network/UI
-        # input can also drop an entry click, so permit three total attempts.
-        for attempt in range(1, 4):
+        # input can also drop an entry click, so permit several safe attempts.
+        for attempt in range(1, self.DUNGEON_ENTRY_RETRIES + 1):
             window, boxes = self.wait_for(["入场"], "ready formation")
             self.require_current_character_fatigue(boxes)
-            self.click_fresh_entry_button(f"entry ({attempt}/3)")
+            self.click_fresh_entry_button(
+                f"entry ({attempt}/{self.DUNGEON_ENTRY_RETRIES})"
+            )
             try:
                 state, window, boxes = self.wait_for_any(
                     {
@@ -3106,9 +3153,15 @@ class AutoDNF:
                     timeout=20,
                 )
             except TimeoutError:
-                if attempt == 3:
-                    raise TimeoutError("入场 did not reach dungeon after three attempts")
-                print(f"入场 did not transition; retrying ({attempt}/3)")
+                if attempt == self.DUNGEON_ENTRY_RETRIES:
+                    raise TimeoutError(
+                        "入场 did not reach dungeon after "
+                        f"{self.DUNGEON_ENTRY_RETRIES} attempts"
+                    )
+                print(
+                    "入场 did not transition; retrying "
+                    f"({attempt}/{self.DUNGEON_ENTRY_RETRIES})"
+                )
                 time.sleep(0.8)
                 continue
             if state == "dungeon":
@@ -3120,7 +3173,10 @@ class AutoDNF:
                 # The confirmation was accepted and the game is loading the
                 # dungeon. The battle loop will continue its normal polling.
                 return
-        raise RuntimeError("Entry materials are still insufficient after three entry attempts")
+        raise RuntimeError(
+            "Entry materials are still insufficient after "
+            f"{self.DUNGEON_ENTRY_RETRIES} entry attempts"
+        )
 
     def cancel_unexpected_dungeon_entry_confirmation(
         self,

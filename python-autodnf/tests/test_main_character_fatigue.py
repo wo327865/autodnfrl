@@ -40,6 +40,22 @@ class MainCharacterFatigueTests(unittest.TestCase):
             flow.enter_dungeon()
         flow.click_fresh_entry_button.assert_not_called()
 
+    def test_entry_transition_retries_eight_times(self):
+        flow = AutoDNF.__new__(AutoDNF)
+        flow.wait_for = Mock(return_value=(object(), [box("入场", 0.85)]))
+        flow.click_fresh_entry_button = Mock()
+        flow.wait_for_any = Mock(side_effect=TimeoutError("no transition"))
+
+        with unittest.mock.patch("autodnf_py.workflow.time.sleep"):
+            with self.assertRaisesRegex(TimeoutError, "after 8 attempts"):
+                flow.enter_dungeon()
+
+        self.assertEqual(flow.click_fresh_entry_button.call_count, 8)
+        self.assertEqual(
+            [call.args[0] for call in flow.click_fresh_entry_button.call_args_list],
+            [f"entry ({attempt}/8)" for attempt in range(1, 9)],
+        )
+
     def test_run_all_returns_to_town_then_rotates(self):
         flow = AutoDNF.__new__(AutoDNF)
         flow.client = Mock()
