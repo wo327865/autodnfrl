@@ -88,6 +88,35 @@ class TournamentPopupTests(unittest.TestCase):
         self.assertFalse(flow.dismiss_known_level_boost_popup(object(), boxes))
         flow.client.click.assert_not_called()
 
+    @patch("autodnf_py.workflow.time.sleep")
+    def test_closes_strong_path_ad_at_top_right_x(self, sleep):
+        flow = self.make_flow()
+        window = object()
+        boxes = [
+            TextBox("强者之路·破阵登峰", 0.40, 0.75, 0.35, 0.08),
+            TextBox("强者之路单人模式玩法现已开启", 0.40, 0.60, 0.35, 0.04),
+        ]
+
+        self.assertTrue(flow.dismiss_known_strong_path_popup(window, boxes))
+        flow.client.click.assert_called_once_with(
+            window,
+            (0.93, 0.92),
+            "close 强者之路 advertisement",
+        )
+        sleep.assert_called_once_with(0.8)
+
+    def test_strong_path_ad_is_not_closed_during_dungeon(self):
+        flow = self.make_flow()
+        flow.in_dungeon = True
+
+        self.assertFalse(
+            flow.dismiss_known_strong_path_popup(
+                object(),
+                [TextBox("破阵登峰", 0.4, 0.7, 0.2, 0.05)],
+            )
+        )
+        flow.client.click.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

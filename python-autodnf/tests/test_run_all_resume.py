@@ -10,6 +10,31 @@ def box(text, x=0.4, y=0.4):
 
 
 class RunAllResumeTests(unittest.TestCase):
+    def test_generic_ui_transition_retries_eight_times_at_one_second(self):
+        flow = AutoDNF.__new__(AutoDNF)
+        flow.client = Mock()
+        window = object()
+        source_boxes = [box("委托")]
+        flow.wait_for = Mock(return_value=(window, source_boxes))
+        flow.wait_for_any = Mock(side_effect=TimeoutError("no transition"))
+        flow.dismiss_known_blocking_popup = Mock(return_value=False)
+        flow.client.find_window.return_value = window
+        flow.client.ocr.return_value = source_boxes
+
+        with self.assertRaisesRegex(TimeoutError, "委托 did not reach"):
+            flow.click_then_wait(
+                "委托",
+                "main screen",
+                ["委托"],
+                {"commission board": ["深渊：时空秘境"]},
+            )
+
+        self.assertEqual(flow.client.click.call_count, 8)
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in flow.wait_for_any.call_args_list],
+            [1.0] * 8,
+        )
+
     def test_character_selection_button_retries_eight_times(self):
         flow = AutoDNF.__new__(AutoDNF)
         flow.client = Mock()

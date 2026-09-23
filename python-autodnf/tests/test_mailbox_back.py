@@ -73,6 +73,30 @@ class MailboxBackTests(unittest.TestCase):
             ],
         )
 
+    def test_mail_confirmation_uses_long_settle_wait_after_button_disappears(self):
+        flow = AutoDNF.__new__(AutoDNF)
+        flow.client = Mock()
+        window = object()
+        confirmation = [TextBox("确认", 0.55, 0.25, 0.10, 0.05)]
+        mailbox = [TextBox("角色邮件", 0.05, 0.80, 0.10, 0.03)]
+        flow.client.find_window.return_value = window
+        flow.client.ocr.side_effect = [confirmation, mailbox]
+        flow.wait_for_settled_mailbox_after_claim = Mock(
+            side_effect=[
+                TimeoutError("still closing after one second"),
+                (window, mailbox),
+            ]
+        )
+
+        result = flow.confirm_mail_reward_and_wait()
+
+        self.assertEqual(result, (window, mailbox))
+        flow.client.click.assert_called_once()
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in flow.wait_for_settled_mailbox_after_claim.call_args_list],
+            [1.0, 15],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

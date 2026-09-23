@@ -31,8 +31,12 @@ class MainCharacterFatigueTests(unittest.TestCase):
 
     def test_entry_guard_does_not_click_with_exhausted_main(self):
         flow = AutoDNF.__new__(AutoDNF)
-        flow.wait_for = Mock(
-            return_value=(object(), [box("入场", 0.85), box("0/100", 0.65)])
+        flow.wait_for_any = Mock(
+            return_value=(
+                "ready formation",
+                object(),
+                [box("入场", 0.85), box("0/100", 0.65)],
+            )
         )
         flow.click_fresh_entry_button = Mock()
 
@@ -42,9 +46,15 @@ class MainCharacterFatigueTests(unittest.TestCase):
 
     def test_entry_transition_retries_eight_times(self):
         flow = AutoDNF.__new__(AutoDNF)
-        flow.wait_for = Mock(return_value=(object(), [box("入场", 0.85)]))
         flow.click_fresh_entry_button = Mock()
-        flow.wait_for_any = Mock(side_effect=TimeoutError("no transition"))
+        window = object()
+
+        def wait_for_entry_state(states, timeout):
+            if "ready formation" in states:
+                return "ready formation", window, [box("入场", 0.85)]
+            raise TimeoutError("no transition")
+
+        flow.wait_for_any = Mock(side_effect=wait_for_entry_state)
 
         with unittest.mock.patch("autodnf_py.workflow.time.sleep"):
             with self.assertRaisesRegex(TimeoutError, "after 8 attempts"):
@@ -55,6 +65,28 @@ class MainCharacterFatigueTests(unittest.TestCase):
             [call.args[0] for call in flow.click_fresh_entry_button.call_args_list],
             [f"entry ({attempt}/8)" for attempt in range(1, 9)],
         )
+
+    def test_delayed_entry_dialog_is_handled_before_clicking_again(self):
+        flow = AutoDNF.__new__(AutoDNF)
+        window = object()
+        flow.click_fresh_entry_button = Mock()
+        flow.resolve_entry_material_confirmation = Mock(return_value=False)
+        flow.wait_for_any = Mock(
+            side_effect=[
+                ("ready formation", window, [box("入场", 0.85)]),
+                TimeoutError("dialog arrived after fast check"),
+                (
+                    "entry material confirmation",
+                    window,
+                    [box("使用角色金库", 0.5)],
+                ),
+            ]
+        )
+
+        flow.enter_dungeon()
+
+        flow.click_fresh_entry_button.assert_called_once_with("entry (1/8)")
+        flow.resolve_entry_material_confirmation.assert_called_once()
 
     def test_run_all_returns_to_town_then_rotates(self):
         flow = AutoDNF.__new__(AutoDNF)

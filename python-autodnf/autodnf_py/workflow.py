@@ -42,6 +42,8 @@ class CharacterBoardRow:
 
 
 class AutoDNF:
+    UI_RETRY_ATTEMPTS = 8
+    UI_RETRY_INTERVAL = 1.0
     # This full-screen event promotion blocks the town UI but has a stable,
     # harmless close X. Its text is used as the required local gate; the click
     # never happens for an arbitrary unrecognised overlay.
@@ -52,6 +54,10 @@ class AutoDNF:
     # the stylised central headline is not.
     TOURNAMENT_POPUP_TEXTS = ("全国格斗大赛秋季赛", "格斗大赛秋季赛")
     TOURNAMENT_POPUP_CLOSE = (0.93, 0.92)
+    # Full-screen 强者之路 promotion shown in town. Its glowing close X uses
+    # the same stable top-right artwork position as the tournament promotion.
+    STRONG_PATH_POPUP_TEXTS = ("破阵登峰", "强者之路单人模式")
+    STRONG_PATH_POPUP_CLOSE = (0.93, 0.92)
     # Post-login level-boost promotion. Its close control is the glowing X in
     # the upper-right artwork, calibrated in window-normalized coordinates.
     LEVEL_BOOST_POPUP_TEXTS = (
@@ -110,8 +116,8 @@ class AutoDNF:
     # window.  0.82 lands just below its lower edge and can be intercepted by
     # the quest panel after a dungeon run.
     CHARACTER_SELECT_POINT = (0.04, 0.85)
-    CHARACTER_SELECT_RETRIES = 8
-    DUNGEON_ENTRY_RETRIES = 8
+    CHARACTER_SELECT_RETRIES = UI_RETRY_ATTEMPTS
+    DUNGEON_ENTRY_RETRIES = UI_RETRY_ATTEMPTS
     # The 挑战进度 board's X is lower than a standard dialog title-bar X.
     CHARACTER_BOARD_CLOSE_POINT = (0.94, 0.87)
     # Calibrated from 2956x1718 window-only captures. Coordinates below use a
@@ -406,9 +412,8 @@ class AutoDNF:
         source_state: str,
         source_texts: list[str],
         next_states: dict[str, list[str]],
-        retries: int = 3,
-        post_click_delay: float = 0.7,
-        retry_source_timeout: float = 3.0,
+        retries: int = UI_RETRY_ATTEMPTS,
+        post_click_delay: float = UI_RETRY_INTERVAL,
     ) -> tuple[str, Window, list[TextBox]]:
         """Click an action and retry only if its source screen remains.
 
@@ -422,20 +427,16 @@ class AutoDNF:
                 print("Dismissed blocking popup; retrying the original action")
                 continue
             self.click_from_boxes(text, window, boxes, f"{text} ({attempt}/{retries})")
-            time.sleep(post_click_delay)
             try:
-                return self.wait_for_any(next_states, timeout=9)
+                return self.wait_for_any(next_states, timeout=post_click_delay)
             except TimeoutError:
-                # Retry only after positively seeing the original screen again.
-                try:
-                    self.wait_for(
-                        source_texts,
-                        source_state,
-                        timeout=retry_source_timeout,
-                    )
-                except TimeoutError:
-                    # The old screen is gone: continue waiting rather than
-                    # issuing a duplicate click into an unknown loading state.
+                # Retry after one second only when a fresh frame positively
+                # proves that the original screen is still present. If it has
+                # disappeared, the UI is transitioning and another click at
+                # the old coordinate would be unsafe.
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                if not all(find(source_text, boxes) for source_text in source_texts):
                     return self.wait_for_any(next_states, timeout=12)
                 print(f"{text} did not transition; retrying ({attempt}/{retries})")
         names = ", ".join(next_states)
@@ -460,7 +461,7 @@ class AutoDNF:
             "town before mailbox",
             timeout=12,
         )
-        while click_count < 8:
+        while click_count < self.UI_RETRY_ATTEMPTS:
             if self.dismiss_known_blocking_popup(window, boxes):
                 print("Dismissed blocking popup; retrying 邮箱 without consuming an attempt")
                 window, boxes = self.wait_for(
@@ -478,20 +479,25 @@ class AutoDNF:
                 # instead of passing the ambiguous result to click_from_boxes,
                 # which intentionally rejects duplicate/missing labels.
                 print("Town 邮箱 control is not OCR-visible; refreshing before retry")
-                time.sleep(1.0)
+                time.sleep(self.UI_RETRY_INTERVAL)
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
                 unresolved_frames += 1
-                if unresolved_frames >= 8:
+                if unresolved_frames >= self.UI_RETRY_ATTEMPTS:
                     raise TimeoutError(
-                        "Town 邮箱 control was not visible in 8 consecutive OCR frames"
+                        "Town 邮箱 control was not visible in "
+                        f"{self.UI_RETRY_ATTEMPTS} consecutive OCR frames"
                     )
                 continue
             unresolved_frames = 0
 
             click_count += 1
-            self.client.click(window, mailbox_point, f"邮箱 ({click_count}/8)")
-            time.sleep(1.0)
+            self.client.click(
+                window,
+                mailbox_point,
+                f"邮箱 ({click_count}/{self.UI_RETRY_ATTEMPTS})",
+            )
+            time.sleep(self.UI_RETRY_INTERVAL)
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             if find("角色邮件", boxes):
@@ -517,7 +523,10 @@ class AutoDNF:
                 self.town_mailbox_point(boxes) is not None
                 or mailbox_point is not None
             ):
-                print(f"邮箱 did not transition; retrying ({click_count}/8)")
+                print(
+                    "邮箱 did not transition; retrying "
+                    f"({click_count}/{self.UI_RETRY_ATTEMPTS})"
+                )
                 continue
 
             # Something did change, so another click at the old coordinate is
@@ -533,12 +542,16 @@ class AutoDNF:
                 ):
                     print(
                         "Mailbox transition returned to town; resuming the "
-                        f"one-second retry loop ({click_count}/8)"
+                        "one-second retry loop "
+                        f"({click_count}/{self.UI_RETRY_ATTEMPTS})"
                     )
                     continue
                 raise
 
-        raise TimeoutError("邮箱 did not open after 8 one-second click attempts")
+        raise TimeoutError(
+            "邮箱 did not open after "
+            f"{self.UI_RETRY_ATTEMPTS} one-second click attempts"
+        )
 
     def town_mailbox_point(
         self,
@@ -577,6 +590,7 @@ class AutoDNF:
             self.dismiss_known_epic_stone_popup,
             self.dismiss_known_activity_popup,
             self.dismiss_known_tournament_popup,
+            self.dismiss_known_strong_path_popup,
             self.dismiss_known_level_boost_popup,
             self.dismiss_known_keyboard_guide_popup,
         )
@@ -608,6 +622,25 @@ class AutoDNF:
             window,
             self.TOURNAMENT_POPUP_CLOSE,
             "close tournament advertisement",
+        )
+        time.sleep(0.8)
+        return True
+
+    def dismiss_known_strong_path_popup(
+        self,
+        window: Window,
+        boxes: list[TextBox],
+    ) -> bool:
+        """Close the town 强者之路·破阵登峰 advertisement at its fixed X."""
+        if self.in_dungeon or not self.client.execute:
+            return False
+        if not any(find(text, boxes) for text in self.STRONG_PATH_POPUP_TEXTS):
+            return False
+        print("Detected 强者之路 advertisement; clicking its close X")
+        self.client.click(
+            window,
+            self.STRONG_PATH_POPUP_CLOSE,
+            "close 强者之路 advertisement",
         )
         time.sleep(0.8)
         return True
@@ -988,7 +1021,7 @@ class AutoDNF:
             (-0.004, -0.012),
         )
         last_error: TimeoutError | None = None
-        for attempt in range(1, 4):
+        for attempt in range(1, self.UI_RETRY_ATTEMPTS + 1):
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             title_boxes = [
@@ -1002,21 +1035,35 @@ class AutoDNF:
                 # the title. Preserve the OCR-derived vertical centre, then
                 # make each retry use a nearby point inside the same arrow.
                 base_x = max(0.012, anchor.x - 0.023)
-                offset_x, offset_y = retry_offsets[attempt - 1]
+                offset_x, offset_y = retry_offsets[(attempt - 1) % len(retry_offsets)]
                 point = (base_x + offset_x, anchor.center[1] + offset_y)
             else:
-                point = fallback_points[attempt - 1]
+                point = fallback_points[(attempt - 1) % len(fallback_points)]
             self.client.click(
                 window,
                 point,
-                f"back from {title} ({attempt}/3)",
+                f"back from {title} ({attempt}/{self.UI_RETRY_ATTEMPTS})",
             )
             try:
-                return self.wait_for_any(expected_states, timeout=10)
+                return self.wait_for_any(
+                    expected_states,
+                    timeout=self.UI_RETRY_INTERVAL,
+                )
             except TimeoutError as error:
                 last_error = error
-                print(f"{title} back click did not transition; retrying ({attempt}/3)")
-                time.sleep(0.4)
+                current_window = self.client.find_window()
+                current_boxes = self.client.ocr(current_window)
+                if not any(
+                    box.center[0] < 0.30 and box.center[1] > 0.85
+                    for box in find(title, current_boxes)
+                ):
+                    # The source page disappeared, so allow a slow transition
+                    # to finish instead of clicking the old arrow position.
+                    return self.wait_for_any(expected_states, timeout=10)
+                print(
+                    f"{title} back click did not transition; retrying "
+                    f"({attempt}/{self.UI_RETRY_ATTEMPTS})"
+                )
         assert last_error is not None
         raise last_error
 
@@ -1281,7 +1328,7 @@ class AutoDNF:
 
     def confirm_mail_reward_and_wait(
         self,
-        attempts: int = 3,
+        attempts: int = UI_RETRY_ATTEMPTS,
     ) -> tuple[Window, list[TextBox]]:
         """Dismiss a claimed-items dialog and verify that it actually closed."""
         last_error: TimeoutError | None = None
@@ -1295,21 +1342,35 @@ class AutoDNF:
                 and 0.12 < box.center[1] < 0.48
             ]
             if len(choices) != 1:
-                # The button can arrive a frame after the title. Give the
-                # animation a brief retry instead of failing the whole role.
-                time.sleep(0.3)
-                continue
+                # The prior click likely closed the button while the reward
+                # artwork is still animating away. There is nothing safe to
+                # click now, so allow the normal settling window instead of
+                # spending eight one-second probes and raising a stale error.
+                try:
+                    return self.wait_for_settled_mailbox_after_claim(
+                        timeout=15
+                    )
+                except TimeoutError as error:
+                    last_error = error
+                    if attempt < attempts:
+                        print(
+                            "Mail reward overlay is still settling; retrying "
+                            f"({attempt}/{attempts})"
+                        )
+                        continue
+                    raise
             self.client.click(
                 window,
                 choices[0].center,
                 f"confirm mail claim ({attempt}/{attempts})",
             )
             try:
-                return self.wait_for_settled_mailbox_after_claim(timeout=6)
+                return self.wait_for_settled_mailbox_after_claim(
+                    timeout=self.UI_RETRY_INTERVAL
+                )
             except TimeoutError as error:
                 last_error = error
                 print(f"Mail reward confirmation did not close; retrying ({attempt}/{attempts})")
-                time.sleep(0.35)
         if last_error is not None:
             raise last_error
         raise TimeoutError("Mail reward confirmation button did not become readable")
@@ -1622,13 +1683,13 @@ class AutoDNF:
             raise RuntimeError("Fixed template matcher is not configured")
         panel_names = ("dismantle_empty", "dismantle_ready")
         last_screenshot: bytes | None = None
-        for attempt in range(1, 9):
+        for attempt in range(1, self.UI_RETRY_ATTEMPTS + 1):
             self.click_template(
                 window,
                 open_match,
-                f"open dismantle panel ({attempt}/8)",
+                f"open dismantle panel ({attempt}/{self.UI_RETRY_ATTEMPTS})",
             )
-            time.sleep(1.0)
+            time.sleep(self.UI_RETRY_INTERVAL)
             window = self.client.find_window()
             last_screenshot = self.client.capture_png_bytes(window)
 
@@ -1647,10 +1708,10 @@ class AutoDNF:
             )
             if still_open is not None:
                 open_match = still_open
-                if attempt < 8:
+                if attempt < self.UI_RETRY_ATTEMPTS:
                     print(
                         "Dismantle panel did not open; retrying "
-                        f"({attempt}/8)"
+                        f"({attempt}/{self.UI_RETRY_ATTEMPTS})"
                     )
                 continue
 
@@ -1673,7 +1734,8 @@ class AutoDNF:
         scores = self.template_matcher.scores(last_screenshot, panel_names)
         details = ", ".join(f"{name}={scores[name]:.3f}" for name in panel_names)
         raise TimeoutError(
-            "Dismantle panel did not open after 8 one-second click attempts: "
+            "Dismantle panel did not open after "
+            f"{self.UI_RETRY_ATTEMPTS} one-second click attempts: "
             f"{details}"
         )
 
@@ -1715,27 +1777,27 @@ class AutoDNF:
             (0.04, 0.96),
             (0.045, 0.92),
         )
-        max_attempts = 8 if title == "邮箱" else 3
+        max_attempts = self.UI_RETRY_ATTEMPTS
         last_error: TimeoutError | None = None
         for attempt in range(1, max_attempts + 1):
             point = back_points[(attempt - 1) % len(back_points)]
             window, _ = self.wait_for([title], state, timeout=12)
             self.client.click(window, point, f"back from {title} ({attempt}/{max_attempts})")
+            time.sleep(self.UI_RETRY_INTERVAL)
             try:
-                if title == "邮箱":
-                    time.sleep(1.0)
-                    window = self.client.find_window()
-                    boxes = self.client.ocr(window)
-                    # The mailbox page itself contains 邮箱 in its header;
-                    # that text alone cannot prove the back click succeeded.
-                    town_visible = (
-                        exact("委托", boxes) and exact("选角", boxes)
-                    ) or self.town_mailbox_point(boxes) is not None
-                    if find("角色邮件", boxes) or not town_visible:
-                        raise TimeoutError("Mailbox back click did not return to town")
+                window = self.client.find_window()
+                boxes = self.client.ocr(window)
+                town_visible = (
+                    exact("委托", boxes) and exact("选角", boxes)
+                ) or self.town_mailbox_point(boxes) is not None
+                if town_visible and not find("角色邮件", boxes):
                     print("Detected town after page exit")
-                else:
-                    self.wait_for_maintenance_town("town after page exit", timeout=12)
+                    return
+                if find(title, boxes):
+                    raise TimeoutError(f"{title} back click did not return to town")
+                # The source page disappeared into a loading transition. Wait
+                # for town instead of sending another click to an old point.
+                self.wait_for_maintenance_town("town after page exit", timeout=12)
                 return
             except TimeoutError as error:
                 last_error = error
@@ -1747,8 +1809,6 @@ class AutoDNF:
                     raise
                 if attempt < max_attempts:
                     print(f"{title} back click did not transition; retrying ({attempt}/{max_attempts})")
-                    if title != "邮箱":
-                        time.sleep(0.6)
         assert last_error is not None
         raise last_error
 
@@ -1831,8 +1891,11 @@ class AutoDNF:
         rift_dismissals = 0
         while self.rift_town_return_panel_open(boxes):
             rift_dismissals += 1
-            if rift_dismissals > 3:
-                print("Rift-town return panel did not close after three attempts")
+            if rift_dismissals > self.UI_RETRY_ATTEMPTS:
+                print(
+                    "Rift-town return panel did not close after "
+                    f"{self.UI_RETRY_ATTEMPTS} attempts"
+                )
                 return False
             button = next(
                 box
@@ -1841,16 +1904,19 @@ class AutoDNF:
             )
             print("Detected open 秘境传送口 panel; returning to town before character selection")
             self.client.click(window, button.center, "dismiss rift-town panel")
-            deadline = time.monotonic() + 12
+            deadline = time.monotonic() + self.UI_RETRY_INTERVAL
             while time.monotonic() < deadline:
-                time.sleep(0.5)
+                time.sleep(min(0.25, self.UI_RETRY_INTERVAL))
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
                 if not self.rift_town_return_panel_open(boxes):
                     print("Rift-town panel closed")
                     break
             else:
-                print(f"Rift-town panel is still open; retrying ({rift_dismissals}/3)")
+                print(
+                    "Rift-town panel is still open; retrying "
+                    f"({rift_dismissals}/{self.UI_RETRY_ATTEMPTS})"
+                )
                 continue
 
         for attempt in range(1, self.CHARACTER_SELECT_RETRIES + 1):
@@ -1860,7 +1926,9 @@ class AutoDNF:
                 f"character selection ({attempt}/{self.CHARACTER_SELECT_RETRIES})",
             )
             try:
-                window, boxes = self.wait_for_character_selection_board(timeout=12)
+                window, boxes = self.wait_for_character_selection_board(
+                    timeout=self.UI_RETRY_INTERVAL
+                )
                 print("Character selection board is ready")
                 break
             except TimeoutError:
@@ -1868,14 +1936,16 @@ class AutoDNF:
                 # controls are positively visible; if a late board render
                 # appears, recognise it before making another click.
                 try:
-                    window, boxes = self.wait_for_character_selection_board(timeout=3)
-                    print("Character selection board finished rendering")
-                    break
-                except TimeoutError:
                     window, boxes = self.wait_for_maintenance_town(
                         "town character controls",
-                        timeout=8,
+                        timeout=self.UI_RETRY_INTERVAL,
                     )
+                except TimeoutError:
+                    window, boxes = self.wait_for_character_selection_board(
+                        timeout=12
+                    )
+                    print("Character selection board finished rendering")
+                    break
                 print(
                     "Character selection did not open; retrying "
                     f"({attempt}/{self.CHARACTER_SELECT_RETRIES})"
@@ -2545,18 +2615,25 @@ class AutoDNF:
             print(f"Current character fatigue: {current_fatigue}/100")
         else:
             print("Current character fatigue was not OCR-visible; using visual card order")
-        for attempt in range(1, 4):
-            self.client.click(window, slot_point, f"first empty party slot ({attempt}/3)")
+        for attempt in range(1, self.UI_RETRY_ATTEMPTS + 1):
+            self.client.click(
+                window,
+                slot_point,
+                f"first empty party slot ({attempt}/{self.UI_RETRY_ATTEMPTS})",
+            )
             try:
                 window, boxes = self.wait_for(
                     ["选择冒险团角色", "编队完成"],
                     "character picker",
-                    timeout=8,
+                    timeout=self.UI_RETRY_INTERVAL,
                 )
                 break
             except TimeoutError:
                 self.wait_for(["普通秘境"], "party setup", timeout=3)
-                print(f"Party picker did not open; retrying ({attempt}/3)")
+                print(
+                    "Party picker did not open; retrying "
+                    f"({attempt}/{self.UI_RETRY_ATTEMPTS})"
+                )
         else:
             raise TimeoutError("Could not open party character picker")
         # The crowned main character is not labelled 选择完成. Select two
@@ -2854,8 +2931,10 @@ class AutoDNF:
             self.client.press(53)
             time.sleep(0.8)
             return False
-        for attempt in range(1, 4):
-            if not self.click_fresh_party_complete(f"编队完成 ({attempt}/3)"):
+        for attempt in range(1, self.UI_RETRY_ATTEMPTS + 1):
+            if not self.click_fresh_party_complete(
+                f"编队完成 ({attempt}/{self.UI_RETRY_ATTEMPTS})"
+            ):
                 # A successful first click can close the picker before the
                 # next OCR pass. In that state 编队完成 correctly has zero
                 # matches; treat the visible 入场 screen as success instead
@@ -2870,9 +2949,9 @@ class AutoDNF:
                 ):
                     print("编队完成 already closed the picker; detected ready formation")
                     return self.verify_complete_party_formation()
-                time.sleep(0.6)
+                time.sleep(self.UI_RETRY_INTERVAL)
                 continue
-            time.sleep(0.8)
+            time.sleep(self.UI_RETRY_INTERVAL)
             # Vision occasionally misses the bright picker title for one
             # frame. Require two consecutive frames without it before
             # deciding that the modal really closed.
@@ -2889,7 +2968,10 @@ class AutoDNF:
                 time.sleep(0.4)
             if picker_absent_frames >= 2:
                 return self.verify_complete_party_formation()
-            print(f"编队完成 did not close the picker; retrying ({attempt}/3)")
+            print(
+                "编队完成 did not close the picker; retrying "
+                f"({attempt}/{self.UI_RETRY_ATTEMPTS})"
+            )
         raise RuntimeError("Party picker did not close after 编队完成")
 
     @staticmethod
@@ -3137,46 +3219,73 @@ class AutoDNF:
         # A successful 一键制作 returns to this formation page; re-clicking
         # 入场 is required to consume the newly made materials. Network/UI
         # input can also drop an entry click, so permit several safe attempts.
-        for attempt in range(1, self.DUNGEON_ENTRY_RETRIES + 1):
-            window, boxes = self.wait_for(["入场"], "ready formation")
-            self.require_current_character_fatigue(boxes)
-            self.click_fresh_entry_button(
-                f"entry ({attempt}/{self.DUNGEON_ENTRY_RETRIES})"
-            )
-            try:
-                state, window, boxes = self.wait_for_any(
-                    {
-                        "entry material confirmation": ["使用角色金库"],
-                        "insufficient entry materials": ["一键制作"],
-                        "dungeon": ["秘境："],
-                    },
-                    timeout=20,
-                )
-            except TimeoutError:
-                if attempt == self.DUNGEON_ENTRY_RETRIES:
-                    raise TimeoutError(
-                        "入场 did not reach dungeon after "
-                        f"{self.DUNGEON_ENTRY_RETRIES} attempts"
-                    )
-                print(
-                    "入场 did not transition; retrying "
-                    f"({attempt}/{self.DUNGEON_ENTRY_RETRIES})"
-                )
-                time.sleep(0.8)
-                continue
+        entry_states = {
+            "ready formation": ["入场"],
+            "entry material confirmation": ["使用角色金库"],
+            "insufficient entry materials": ["一键制作"],
+            "dungeon": ["秘境："],
+        }
+        transition_states = {
+            state: texts
+            for state, texts in entry_states.items()
+            if state != "ready formation"
+        }
+        attempt = 0
+        pending_state: tuple[str, Window, list[TextBox]] | None = None
+        while True:
+            if pending_state is None:
+                state, window, boxes = self.wait_for_any(entry_states, timeout=18)
+            else:
+                state, window, boxes = pending_state
+                pending_state = None
+
+            # A prior click may transition after its one-second fast check.
+            # Handle that delayed state before requiring or clicking 入场 again.
             if state == "dungeon":
                 return
             if state == "insufficient entry materials":
                 self.craft_maximum_entry_materials(window, boxes)
                 continue
-            if not self.resolve_entry_material_confirmation(window, boxes, "entry material confirmation"):
-                # The confirmation was accepted and the game is loading the
-                # dungeon. The battle loop will continue its normal polling.
-                return
-        raise RuntimeError(
-            "Entry materials are still insufficient after "
-            f"{self.DUNGEON_ENTRY_RETRIES} entry attempts"
-        )
+            if state == "entry material confirmation":
+                if not self.resolve_entry_material_confirmation(
+                    window,
+                    boxes,
+                    "entry material confirmation",
+                ):
+                    # The confirmation was accepted and the game is loading
+                    # the dungeon. The battle loop will continue polling.
+                    return
+                continue
+
+            if attempt >= self.DUNGEON_ENTRY_RETRIES:
+                raise TimeoutError(
+                    "入场 did not reach dungeon after "
+                    f"{self.DUNGEON_ENTRY_RETRIES} attempts"
+                )
+            self.require_current_character_fatigue(boxes)
+            attempt += 1
+            self.click_fresh_entry_button(
+                f"entry ({attempt}/{self.DUNGEON_ENTRY_RETRIES})"
+            )
+            try:
+                pending_state = self.wait_for_any(
+                    transition_states,
+                    timeout=self.UI_RETRY_INTERVAL,
+                )
+            except TimeoutError:
+                if attempt == self.DUNGEON_ENTRY_RETRIES:
+                    try:
+                        pending_state = self.wait_for_any(entry_states, timeout=18)
+                    except TimeoutError as error:
+                        raise TimeoutError(
+                            "入场 did not reach dungeon after "
+                            f"{self.DUNGEON_ENTRY_RETRIES} attempts"
+                        ) from error
+                    continue
+                print(
+                    "入场 did not transition; retrying "
+                    f"({attempt}/{self.DUNGEON_ENTRY_RETRIES})"
+                )
 
     def cancel_unexpected_dungeon_entry_confirmation(
         self,
@@ -3464,11 +3573,11 @@ class AutoDNF:
 
     def retry_or_exit(self) -> bool:
         """Retry the dungeon, returning True only when settlement was chosen."""
-        for attempt in range(1, 4):
+        for attempt in range(1, self.UI_RETRY_ATTEMPTS + 1):
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             if self.cancel_unexpected_dungeon_entry_confirmation(window, boxes):
-                time.sleep(0.8)
+                time.sleep(self.UI_RETRY_INTERVAL)
                 window, boxes = self.wait_for(
                     ["再次挑战", "领奖结算"],
                     "boss result after accidental portal cancellation",
@@ -3478,7 +3587,11 @@ class AutoDNF:
             if len(retry_buttons) != 1 or len(settlement_buttons) != 1:
                 print("Boss-result controls are no longer present; resuming dungeon movement")
                 return False
-            self.client.click(window, retry_buttons[0].center, f"retry ({attempt}/3)")
+            self.client.click(
+                window,
+                retry_buttons[0].center,
+                f"retry ({attempt}/{self.UI_RETRY_ATTEMPTS})",
+            )
             try:
                 state, window, boxes = self.wait_for_any(
                     {
@@ -3488,7 +3601,7 @@ class AutoDNF:
                         "next challenge confirmation": ["再次挑战", "确认"],
                         "start challenge confirmation": ["开始挑战", "确认"],
                     },
-                    timeout=7,
+                    timeout=self.UI_RETRY_INTERVAL,
                 )
                 if state == "entry material confirmation":
                     crafted_materials = self.resolve_entry_material_confirmation(
@@ -3529,7 +3642,11 @@ class AutoDNF:
                     return True
                 print("Retry did not transition; sweeping boss rewards again")
                 self.collect_visible_rewards()
-        raise RuntimeError("Items still remain after three reward-collection sweeps")
+                time.sleep(self.UI_RETRY_INTERVAL)
+        raise RuntimeError(
+            "Items still remain after "
+            f"{self.UI_RETRY_ATTEMPTS} reward-collection sweeps"
+        )
 
     @staticmethod
     def dungeon_current_fatigue(boxes: list[TextBox]) -> int | None:
@@ -3662,7 +3779,7 @@ class AutoDNF:
         # dialog beneath it.
         time.sleep(0.55)
         keypad_closed = False
-        for attempt in range(1, 4):
+        for attempt in range(1, self.UI_RETRY_ATTEMPTS + 1):
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             if not find("输入数量", boxes):
@@ -3671,9 +3788,10 @@ class AutoDNF:
             self.client.click(
                 window,
                 self.ENTRY_CRAFT_INPUT,
-                f"apply maximum entry material quantity ({attempt}/3)",
+                "apply maximum entry material quantity "
+                f"({attempt}/{self.UI_RETRY_ATTEMPTS})",
             )
-            time.sleep(0.7)
+            time.sleep(self.UI_RETRY_INTERVAL)
             window = self.client.find_window()
             boxes = self.client.ocr(window)
             if not find("输入数量", boxes):
