@@ -88,6 +88,35 @@ class MainCharacterFatigueTests(unittest.TestCase):
         flow.click_fresh_entry_button.assert_called_once_with("entry (1/8)")
         flow.resolve_entry_material_confirmation.assert_called_once()
 
+    def test_missing_fresh_entry_button_is_treated_as_in_progress_transition(self):
+        flow = AutoDNF.__new__(AutoDNF)
+        window = object()
+        flow.click_fresh_entry_button = Mock(side_effect=[True, False])
+        flow.wait_for_any = Mock(
+            side_effect=[
+                ("ready formation", window, [box("入场", 0.85)]),
+                TimeoutError("first click is still loading"),
+                ("ready formation", window, [box("入场", 0.85)]),
+                ("dungeon", window, [box("秘境：侵蚀之地", 0.85)]),
+            ]
+        )
+
+        flow.enter_dungeon()
+
+        self.assertEqual(flow.click_fresh_entry_button.call_count, 2)
+        self.assertEqual(
+            flow.wait_for_any.call_args_list[-1].kwargs["timeout"],
+            flow.UI_RETRY_INTERVAL,
+        )
+
+    def test_fresh_entry_click_reports_disappeared_button(self):
+        flow = AutoDNF.__new__(AutoDNF)
+        flow.client = Mock()
+        flow.client.ocr.return_value = [box("普通秘境", 0.1)]
+
+        self.assertFalse(flow.click_fresh_entry_button("entry (2/8)"))
+        flow.client.click.assert_not_called()
+
     def test_run_all_returns_to_town_then_rotates(self):
         flow = AutoDNF.__new__(AutoDNF)
         flow.client = Mock()

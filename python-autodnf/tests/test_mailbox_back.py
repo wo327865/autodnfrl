@@ -97,6 +97,37 @@ class MailboxBackTests(unittest.TestCase):
             [1.0, 15],
         )
 
+    def test_claim_all_retries_eight_times_at_one_second(self):
+        flow = AutoDNF.__new__(AutoDNF)
+        flow.client = Mock()
+        window = object()
+        mailbox = [
+            TextBox("角色邮件", 0.05, 0.80, 0.10, 0.03),
+            TextBox("领取全部物品", 0.55, 0.10, 0.16, 0.04),
+        ]
+        flow.open_mailbox_with_fast_retries = Mock(return_value=(window, mailbox))
+        flow.wait_for_mail_claim_result = Mock(
+            side_effect=TimeoutError("claim did not transition")
+        )
+        flow.client.find_window.return_value = window
+        flow.client.ocr.return_value = mailbox
+        flow.return_to_town_from_page = Mock()
+
+        self.assertTrue(flow.receive_all_character_mail())
+
+        labels = [call.args[2] for call in flow.client.click.call_args_list]
+        self.assertEqual(
+            labels,
+            [
+                f"claim all mail items (batch 1, attempt {attempt}/8)"
+                for attempt in range(1, 9)
+            ],
+        )
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in flow.wait_for_mail_claim_result.call_args_list],
+            [1.0] * 8,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

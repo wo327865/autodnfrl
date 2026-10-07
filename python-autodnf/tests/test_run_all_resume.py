@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import Mock
 
 from autodnf_py.macos import TextBox
-from autodnf_py.workflow import AutoDNF
+from autodnf_py.workflow import AutoDNF, CharacterBoardRow
 
 
 def box(text, x=0.4, y=0.4):
@@ -10,6 +10,37 @@ def box(text, x=0.4, y=0.4):
 
 
 class RunAllResumeTests(unittest.TestCase):
+    @unittest.mock.patch("autodnf_py.workflow.time.sleep")
+    def test_character_row_must_visually_change_before_start_is_allowed(self, sleep):
+        flow = AutoDNF.__new__(AutoDNF)
+        flow.client = Mock()
+        window = object()
+        flow.client.find_window.return_value = window
+        flow.client.capture_png_bytes.side_effect = [b"unchanged", b"selected"]
+        flow.client.region_difference.side_effect = [0.2, 4.0]
+        row = CharacterBoardRow(
+            top=0.30,
+            bottom=0.42,
+            click_y=0.64,
+            level=80,
+            fatigue=100,
+            online=False,
+        )
+
+        selected, result_window = flow.select_character_board_row(
+            window,
+            row,
+            b"before",
+        )
+
+        self.assertTrue(selected)
+        self.assertIs(result_window, window)
+        self.assertEqual(flow.client.click.call_count, 2)
+        self.assertEqual(
+            [call.args[2] for call in flow.client.click.call_args_list],
+            ["select available character (1/8)", "select available character (2/8)"],
+        )
+
     def test_generic_ui_transition_retries_eight_times_at_one_second(self):
         flow = AutoDNF.__new__(AutoDNF)
         flow.client = Mock()

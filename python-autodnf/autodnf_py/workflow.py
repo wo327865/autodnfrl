@@ -1155,16 +1155,55 @@ class AutoDNF:
                 if len(claim) != 1:
                     print("No enabled claim-all mail button was detected")
                     break
-                time.sleep(0.35)
                 claim_point = claim[0].center
                 claimed_batch = False
-                for claim_attempt in range(1, 3):
+                for claim_attempt in range(1, self.UI_RETRY_ATTEMPTS + 1):
                     self.client.click(
                         window,
                         claim_point,
-                        f"claim all mail items (batch {batch}, attempt {claim_attempt}/2)",
+                        "claim all mail items "
+                        f"(batch {batch}, attempt "
+                        f"{claim_attempt}/{self.UI_RETRY_ATTEMPTS})",
                     )
-                    state, window, boxes = self.wait_for_mail_claim_result()
+                    try:
+                        state, window, boxes = self.wait_for_mail_claim_result(
+                            timeout=self.UI_RETRY_INTERVAL
+                        )
+                    except TimeoutError:
+                        window = self.client.find_window()
+                        boxes = self.client.ocr(window)
+                        confirmations = [
+                            box
+                            for box in exact("确认", boxes)
+                            if 0.38 < box.center[0] < 0.76
+                            and 0.12 < box.center[1] < 0.55
+                        ]
+                        source_unchanged = (
+                            bool(find("角色邮件", boxes))
+                            and len(exact("领取全部物品", boxes)) == 1
+                            and not find("背包已满", boxes)
+                            and not find("获得道具", boxes)
+                            and not confirmations
+                        )
+                        if source_unchanged:
+                            refreshed_claim = exact("领取全部物品", boxes)
+                            claim_point = refreshed_claim[0].center
+                            if claim_attempt < self.UI_RETRY_ATTEMPTS:
+                                print(
+                                    "Claim-all produced no effect; retrying "
+                                    f"({claim_attempt}/{self.UI_RETRY_ATTEMPTS})"
+                                )
+                                continue
+                            print(
+                                "Mail claim did not open a reward dialog after "
+                                f"{self.UI_RETRY_ATTEMPTS} one-second attempts; "
+                                "treating mailbox as empty"
+                            )
+                            break
+                        # The source page changed or a foreground overlay began
+                        # rendering. Stop clicking and allow that transition its
+                        # normal completion window.
+                        state, window, boxes = self.wait_for_mail_claim_result()
                     if state == "backpack full":
                         print(
                             "Detected 背包已满 while claiming mail; "
@@ -1177,23 +1216,6 @@ class AutoDNF:
                         claimed_batch = True
                         print(f"Claimed character-mail batch {batch}")
                         break
-
-                    # The network can drop the initial claim input. Refresh
-                    # its OCR centre and make one quicker retry.
-                    refreshed_claim = exact("领取全部物品", boxes)
-                    if len(refreshed_claim) == 1:
-                        claim_point = refreshed_claim[0].center
-                    if (
-                        claim_attempt == 1
-                        and find("角色邮件", boxes)
-                        and not find("未收到邮件", boxes)
-                    ):
-                        print(
-                            "Claim-all produced no effect and the mailbox is "
-                            "still unchanged; retrying once"
-                        )
-                        time.sleep(0.175)
-                        continue
                     print(
                         "Mail claim did not open a reward dialog after the "
                         "allowed attempt(s); treating mailbox as empty"
@@ -1523,13 +1545,68 @@ class AutoDNF:
             if match.name == "dismantle_empty":
                 print("Template detected no selectable equipment")
                 break
-            self.click_template(window, match, f"dismantle batch {batch}")
-
-            window, prompt = self.wait_for_template_any(
-                ("dismantle_confirm",),
-                "dismantle confirmation",
-                timeout=12,
-            )
+            prompt: TemplateMatch | None = None
+            stop_dismantling = False
+            for attempt in range(1, self.UI_RETRY_ATTEMPTS + 1):
+                self.click_template(
+                    window,
+                    match,
+                    f"dismantle batch {batch} ({attempt}/{self.UI_RETRY_ATTEMPTS})",
+                )
+                try:
+                    window, prompt = self.wait_for_template_any(
+                        ("dismantle_confirm",),
+                        "dismantle confirmation",
+                        timeout=self.UI_RETRY_INTERVAL,
+                    )
+                    break
+                except TimeoutError:
+                    window = self.client.find_window()
+                    screenshot = self.client.capture_png_bytes(window)
+                    empty = self.template_matcher.match(
+                        screenshot,
+                        "dismantle_empty",
+                    )
+                    if empty is not None:
+                        print("Template detected no selectable equipment")
+                        stop_dismantling = True
+                        break
+                    ready = self.template_matcher.match(
+                        screenshot,
+                        "dismantle_ready",
+                    )
+                    if ready is None:
+                        # The panel changed, so do not click the stale button.
+                        # Give the confirmation its normal rendering allowance.
+                        window, prompt = self.wait_for_template_any(
+                            ("dismantle_confirm",),
+                            "dismantle confirmation after transition",
+                            timeout=12,
+                        )
+                        break
+                    boxes = self.client.ocr(window)
+                    if find("需要解除封印", boxes):
+                        print(
+                            "Only sealed equipment remains; stopping "
+                            "dismantling without waiting for a confirmation"
+                        )
+                        stop_dismantling = True
+                        break
+                    match = ready
+                    if attempt < self.UI_RETRY_ATTEMPTS:
+                        print(
+                            "分解 did not open its confirmation; retrying "
+                            f"({attempt}/{self.UI_RETRY_ATTEMPTS})"
+                        )
+            else:
+                raise TimeoutError(
+                    "分解 did not open its confirmation after "
+                    f"{self.UI_RETRY_ATTEMPTS} one-second attempts"
+                )
+            if stop_dismantling:
+                break
+            if prompt is None:
+                raise TimeoutError("Dismantle confirmation did not become available")
             # The first confirmation can be followed by a high-value warning
             # and a completion acknowledgement. All variants share the same
             # logical name but carry their own crop and click offset.
@@ -1572,15 +1649,66 @@ class AutoDNF:
             timeout=10,
             stable_frames=2,
         )
-        self.click_template(window, close, "close empty dismantle panel")
-        window, _ = self.wait_for_template_any(
-            ("dismantle_open", "inventory_ready"),
-            "inventory after dismantle close",
-            timeout=12,
-            stable_frames=2,
-        )
+        window = self.close_dismantle_panel_with_retries(window, close)
         self.client.click(window, self.PAGE_BACK_POINT, "back from inventory")
         self.wait_for(["委托", "选角"], "town after inventory exit", timeout=25)
+
+    def close_dismantle_panel_with_retries(
+        self,
+        window: Window,
+        close: TemplateMatch,
+    ) -> Window:
+        """Retry the panel X once per second only while it remains visible."""
+        if self.template_matcher is None:
+            raise RuntimeError("Fixed template matcher is not configured")
+        close_visible = True
+        for attempt in range(1, self.UI_RETRY_ATTEMPTS + 1):
+            if close_visible:
+                self.click_template(
+                    window,
+                    close,
+                    "close empty dismantle panel "
+                    f"({attempt}/{self.UI_RETRY_ATTEMPTS})",
+                )
+            time.sleep(self.UI_RETRY_INTERVAL)
+            window = self.client.find_window()
+            screenshot = self.client.capture_png_bytes(window)
+            for name in ("dismantle_open", "inventory_ready"):
+                inventory = self.template_matcher.match(screenshot, name)
+                if inventory is not None:
+                    print(f"Detected inventory after dismantle close: {name}")
+                    return window
+
+            close_match = self.template_matcher.match(screenshot, "dismantle_close")
+            if close_match is not None:
+                close, close_visible = close_match, True
+                if attempt < self.UI_RETRY_ATTEMPTS:
+                    print(
+                        "Dismantle panel is still open; retrying close "
+                        f"({attempt}/{self.UI_RETRY_ATTEMPTS})"
+                    )
+                continue
+
+            close_visible = False
+            boxes = self.client.ocr(window)
+            if (
+                find("背包", boxes)
+                and find("道具", boxes)
+                and not find("需要解除封印", boxes)
+                and not find("分解装备库", boxes)
+            ):
+                print("OCR detected inventory after dismantle close")
+                return window
+            if attempt < self.UI_RETRY_ATTEMPTS:
+                print(
+                    "Dismantle close transition is still rendering; rechecking "
+                    f"({attempt}/{self.UI_RETRY_ATTEMPTS})"
+                )
+
+        raise TimeoutError(
+            "Dismantle panel did not return to a verified inventory after "
+            f"{self.UI_RETRY_ATTEMPTS} one-second checks"
+        )
 
     def dismiss_dismantle_reward_popup(self, timeout: float = 3.0) -> bool:
         """Acknowledge the delayed 获得道具 dialog after a dismantle batch."""
@@ -2109,18 +2237,19 @@ class AutoDNF:
                         else "fatigue ignored for maintenance"
                     )
                 )
+                selection_verified, window = self.select_character_board_row(
+                    window,
+                    selected,
+                    frame,
+                )
+                if not selection_verified:
+                    print(
+                        "Could not verify selection of the next character; "
+                        "not clicking 开始游戏"
+                    )
+                    return False
                 if processed is not None:
                     processed.add(f"role-{len(processed) + 1}")
-                self.client.click(
-                    window,
-                    (0.45, selected.click_y),
-                    (
-                        f"available character ({selected.fatigue}/100)"
-                        if selected.fatigue is not None
-                        else "available maintenance character"
-                    ),
-                )
-                time.sleep(0.8)
                 window = self.client.find_window()
                 boxes = self.client.ocr(window)
                 self.click_right_button("开始游戏", window, boxes, "start selected character")
@@ -2239,6 +2368,52 @@ class AutoDNF:
             time.sleep(0.5)
             window = self.client.find_window()
             boxes = self.client.ocr(window)
+
+    def select_character_board_row(
+        self,
+        window: Window,
+        selected: CharacterBoardRow,
+        before_selection: bytes,
+    ) -> tuple[bool, Window]:
+        """Click a non-online row only until its visual selection state changes."""
+        selection_region = (
+            self.CHARACTER_BOARD_PANEL[0],
+            selected.top,
+            self.CHARACTER_BOARD_PANEL[2],
+            selected.bottom,
+        )
+        for attempt in range(1, self.UI_RETRY_ATTEMPTS + 1):
+            self.client.click(
+                window,
+                (0.45, selected.click_y),
+                f"select available character ({attempt}/{self.UI_RETRY_ATTEMPTS})",
+            )
+            time.sleep(self.UI_RETRY_INTERVAL)
+            window = self.client.find_window()
+            after_selection = self.client.capture_png_bytes(window)
+            difference = self.client.region_difference(
+                before_selection,
+                after_selection,
+                selection_region,
+            )
+            if difference is not None and difference >= 1.0:
+                print(
+                    "Verified character-board selection changed "
+                    f"(difference {difference:.2f})"
+                )
+                return True, window
+            if difference is None:
+                print(
+                    "Character-board selection change could not be measured; "
+                    "retrying"
+                )
+            else:
+                print(
+                    "Character row remained unchanged; retrying "
+                    f"({attempt}/{self.UI_RETRY_ATTEMPTS}, "
+                    f"difference {difference:.2f})"
+                )
+        return False, window
 
     @classmethod
     def character_board_row_regions(
@@ -3264,9 +3439,36 @@ class AutoDNF:
                 )
             self.require_current_character_fatigue(boxes)
             attempt += 1
-            self.click_fresh_entry_button(
+            entry_clicked = self.click_fresh_entry_button(
                 f"entry ({attempt}/{self.DUNGEON_ENTRY_RETRIES})"
             )
+            if entry_clicked is False:
+                # The previous click can already have removed the formation
+                # controls while OCR still returns one stale ready-formation
+                # frame.  A missing fresh button is therefore a transition
+                # signal, not an immediate fatal error.  Poll all legitimate
+                # states for one retry interval and let the loop handle the
+                # result without sending a blind second click.
+                print(
+                    "Fresh 入场 button is no longer visible; checking whether "
+                    "the dungeon entry already succeeded"
+                )
+                try:
+                    pending_state = self.wait_for_any(
+                        entry_states,
+                        timeout=self.UI_RETRY_INTERVAL,
+                    )
+                except TimeoutError:
+                    if attempt == self.DUNGEON_ENTRY_RETRIES:
+                        raise TimeoutError(
+                            "入场 did not reach dungeon after "
+                            f"{self.DUNGEON_ENTRY_RETRIES} attempts"
+                        )
+                    print(
+                        "Dungeon transition is not readable yet; retrying state "
+                        f"check ({attempt}/{self.DUNGEON_ENTRY_RETRIES})"
+                    )
+                continue
             try:
                 pending_state = self.wait_for_any(
                     transition_states,
@@ -3372,7 +3574,12 @@ class AutoDNF:
         window = self.client.find_window()
         center = self.wait_for_reward_pile(timeout=2.4)
         if center is None:
-            self.explore_for_rewards()
+            if self.explore_for_rewards():
+                # Reaching the right camera edge gives the game's automatic
+                # pickup enough time to collect any remaining drops. Resume
+                # the outer battle cycle instead of traversing back left and
+                # performing a redundant central sweep.
+                return
             window = self.client.find_window()
             center = self.wait_for_reward_pile(timeout=2.4)
         if center is not None:
@@ -3487,39 +3694,40 @@ class AutoDNF:
                 )
         return self.reward_pile_center(self.client.ocr(window))
 
-    def explore_for_rewards(self) -> None:
-        """Search right first, then left when the right camera edge is reached."""
-        print("No reward cue visible; exploring right, then left if needed")
-        for direction, keycode in (("right", 124), ("left", 123)):
-            stationary_frames = 0
-            for step in range(1, 13):
-                window = self.client.find_window()
-                if self.detect_reward_pile(window) is not None:
-                    print(f"Found reward pile while exploring {direction}")
-                    return
-                before = self.client.world_phase_frame(window)
-                print(f"Exploring {direction} ({step}/12)")
-                self.client.hold([keycode], 0.45)
-                time.sleep(0.35)
-                window = self.client.find_window()
-                after = self.client.world_phase_frame(window)
-                shift_x, shift_y, response = self.client.phase_camera_motion(before, after)
-                camera_moved = response >= 0.08 and abs(shift_x) >= 2.5
-                if self.debug:
+    def explore_for_rewards(self) -> bool:
+        """Search right; return true when edge arrival makes manual pickup unnecessary."""
+        print("No reward cue visible; exploring right until the camera edge")
+        stationary_frames = 0
+        for step in range(1, 13):
+            window = self.client.find_window()
+            if self.detect_reward_pile(window) is not None:
+                print("Found reward pile while exploring right")
+                return False
+            before = self.client.world_phase_frame(window)
+            print(f"Exploring right ({step}/12)")
+            self.client.hold([124], 0.45)
+            time.sleep(0.35)
+            window = self.client.find_window()
+            after = self.client.world_phase_frame(window)
+            shift_x, shift_y, response = self.client.phase_camera_motion(before, after)
+            camera_moved = response >= 0.08 and abs(shift_x) >= 2.5
+            if self.debug:
+                print(
+                    f"  camera phase shift=({shift_x:.2f}, {shift_y:.2f}), "
+                    f"response={response:.3f}, horizontal_motion={camera_moved}"
+                )
+            if not camera_moved:
+                stationary_frames += 1
+                if stationary_frames >= 2:
                     print(
-                        f"  camera phase shift=({shift_x:.2f}, {shift_y:.2f}), "
-                        f"response={response:.3f}, horizontal_motion={camera_moved}"
+                        "Reached right camera edge; waiting one second for "
+                        "automatic item pickup, then resuming the battle cycle"
                     )
-                if not camera_moved:
-                    stationary_frames += 1
-                    if stationary_frames >= 2:
-                        print(
-                            f"Reached {direction} camera edge "
-                            f"(no coherent horizontal camera translation)"
-                        )
-                        break
-                else:
-                    stationary_frames = 0
+                    time.sleep(self.UI_RETRY_INTERVAL)
+                    return True
+            else:
+                stationary_frames = 0
+        return False
 
     @staticmethod
     def reward_pile_center(boxes: list[TextBox]) -> tuple[float, float] | None:
@@ -3686,8 +3894,8 @@ class AutoDNF:
             and any(box.center[0] > 0.78 for box in exact("返回城镇", boxes))
         )
 
-    def click_fresh_entry_button(self, label: str) -> None:
-        """OCR-locate the lower-right 入场 button in the latest rendered frame."""
+    def click_fresh_entry_button(self, label: str) -> bool:
+        """Click a freshly visible lower-right 入场, or report its disappearance."""
         window = self.client.find_window()
         boxes = self.client.ocr(window)
         choices = [
@@ -3695,11 +3903,14 @@ class AutoDNF:
             for box in exact("入场", boxes)
             if box.center[0] > 0.75 and box.center[1] < 0.18
         ]
+        if not choices:
+            return False
         if len(choices) != 1:
             raise RuntimeError(
                 f"Could not freshly identify one lower-right 入场 button (found {len(choices)})"
             )
         self.client.click(window, choices[0].center, label)
+        return True
 
     def click_entry_material_confirmation(
         self,
