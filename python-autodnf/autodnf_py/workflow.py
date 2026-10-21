@@ -1650,8 +1650,7 @@ class AutoDNF:
             stable_frames=2,
         )
         window = self.close_dismantle_panel_with_retries(window, close)
-        self.client.click(window, self.PAGE_BACK_POINT, "back from inventory")
-        self.wait_for(["委托", "选角"], "town after inventory exit", timeout=25)
+        self.return_to_town_from_page("背包", "inventory")
 
     def close_dismantle_panel_with_retries(
         self,
@@ -1692,10 +1691,15 @@ class AutoDNF:
             close_visible = False
             boxes = self.client.ocr(window)
             if (
-                find("背包", boxes)
-                and find("道具", boxes)
+                exact("背包", boxes)
+                and exact("道具", boxes)
+                and not find("没有可选择的道具", boxes)
                 and not find("需要解除封印", boxes)
                 and not find("分解装备库", boxes)
+                and not any(
+                    0.3 < box.center[0] < 0.7 and box.center[1] > 0.8
+                    for box in exact("分解", boxes)
+                )
             ):
                 print("OCR detected inventory after dismantle close")
                 return window

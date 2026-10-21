@@ -42,6 +42,31 @@ state.
 
 ## Mail and dismantle maintenance
 
+`./run-all.sh` runs battle followed by maintenance and sends an ntfy push on
+completion, failure, or manual stop. Logs are stored locally under `logs/`.
+`./maintenance.sh` sends the same notifications when running maintenance alone.
+Direct Python commands do not send notifications; use these shell launchers.
+Notifications use neutral titles and contain only a numbered stage, elapsed time, and exit status;
+full logs stay on the Mac. Delivery failures do not change the run's exit status.
+
+Configure `.ntfy.json` (ignored by Git):
+
+```json
+{"enabled": true, "server": "https://ntfy.sh", "topic": "YOUR_TOPIC", "token": ""}
+```
+
+For a protected topic, set its publishing access token in this local file or
+the `NTFY_TOKEN` environment variable. `NTFY_SERVER` and `NTFY_TOPIC` also
+override the file. Set `enabled` to false to disable notifications.
+Test without running the game:
+
+```sh
+.venv/bin/python -m autodnf_py.notify --test
+```
+
+A subscription alone does not make a topic private; configure topic access
+permissions in ntfy. See [ntfy authentication](https://docs.ntfy.sh/publish/#authentication).
+
 ```sh
 python -m autodnf_py maintenance --execute --debug
 ```

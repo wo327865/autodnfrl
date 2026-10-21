@@ -148,6 +148,7 @@ def main() -> None:
             print("\nControl+T pressed. AutoDNF stopped.")
         else:
             print("\nAutoDNF interrupted.")
+        raise SystemExit(130)
     finally:
         shortcut.close()
 

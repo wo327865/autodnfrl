@@ -98,8 +98,10 @@ class DismantleOpenRetryTests(unittest.TestCase):
             TextBox("需要解除封印", 0.40, 0.55, 0.15, 0.04)
         ]
         flow.wait_for = Mock(return_value=(window, []))
+        flow.return_to_town_from_page = Mock()
 
         flow.dismantle_all_available_equipment_by_template()
+        flow.return_to_town_from_page.assert_called_once_with("背包", "inventory")
 
         labels = [call.args[2] for call in flow.click_template.call_args_list]
         self.assertEqual(
@@ -161,6 +163,20 @@ class DismantleOpenRetryTests(unittest.TestCase):
 
         self.assertEqual(flow.click_template.call_count, 8)
         self.assertEqual(sleep.call_args_list, [call(1.0)] * 8)
+
+    @patch("autodnf_py.workflow.time.sleep")
+    def test_empty_panel_text_is_not_inventory_even_when_close_template_misses(self, sleep):
+        flow, window = self.make_flow()
+        flow.template_matcher.match.return_value = None
+        flow.client.ocr.return_value = [
+            TextBox("背包", 0.08, 0.9, 0.05, 0.04),
+            TextBox("道具", 0.08, 0.6, 0.05, 0.04),
+            TextBox("没有可选择的道具", 0.4, 0.5, 0.2, 0.04),
+        ]
+        with self.assertRaisesRegex(TimeoutError, "8 one-second checks"):
+            flow.close_dismantle_panel_with_retries(window, match("dismantle_close"))
+        # An unrecognized overlay must not authorize a Back click in town.
+        flow.click_template.assert_called_once()
 
 
 if __name__ == "__main__":

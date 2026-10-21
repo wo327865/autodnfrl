@@ -37,6 +37,27 @@ class MailboxBackTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 2)
 
     @patch("autodnf_py.workflow.time.sleep")
+    def test_inventory_back_retries_then_accepts_mailbox_enabled_town(self, sleep):
+        flow = self.make_flow()
+        inventory = [TextBox("背包", 0.05, 0.9, 0.05, 0.03)]
+        town = [TextBox("邮箱", 0.3, 0.1, 0.05, 0.03)]
+        flow.client.ocr.side_effect = [inventory, inventory, town]
+
+        flow.return_to_town_from_page("背包", "inventory")
+
+        self.assertEqual(flow.client.click.call_count, 2)
+        self.assertEqual([item.args for item in sleep.call_args_list], [(1.0,), (1.0,)])
+
+    @patch("autodnf_py.workflow.time.sleep")
+    def test_inventory_back_stops_after_eight_unchanged_attempts(self, sleep):
+        flow = self.make_flow()
+        flow.client.ocr.return_value = [TextBox("背包", 0.05, 0.9, 0.05, 0.03)]
+        with self.assertRaises(TimeoutError):
+            flow.return_to_town_from_page("背包", "inventory")
+        self.assertEqual(flow.client.click.call_count, 8)
+        self.assertEqual([item.args for item in sleep.call_args_list], [(1.0,)] * 8)
+
+    @patch("autodnf_py.workflow.time.sleep")
     def test_delayed_login_ad_is_closed_without_consuming_mailbox_attempt(self, sleep):
         flow = AutoDNF.__new__(AutoDNF)
         flow.debug = False

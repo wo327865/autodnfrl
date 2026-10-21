@@ -1,5 +1,7 @@
 .venv/
 .env
+.ntfy.json
+logs/
 # Captures and hand-authored labels are training source data and are tracked.
 # `dataset/yolo` is a reproducible split made of machine-local symlinks.
 dataset/yolo/
